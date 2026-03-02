@@ -16,6 +16,7 @@ import datetime
 import requests
 
 from torch.optim.lr_scheduler import _LRScheduler
+import torch.nn.functional as F
 
 def sparse_to_tuple(sparse_mx, insert_batch=False):
     """Convert sparse matrix to tuple representation."""
@@ -568,6 +569,105 @@ def nagphormer_tokenization(features, adj, args):
         steped_nodes_features = node_neighborhood_feature(adj, features, hop+1, args.progregate_alpha)
         nodes_features = torch.concat((nodes_features, steped_nodes_features.unsqueeze(1)), dim=1)
     return nodes_features
+
+def krylov_orthogonal_tokenization(features, adj, args):
+    """
+    基于 Krylov 子空间的 Arnoldi 正交化 Tokenization 方法
+    通过正交化彻底消除 Token 间的冗余 (Spectral Collapse)
+    
+    Args:
+        features: 原始特征矩阵, size = (N, d)
+        adj: 归一化的邻接矩阵, size = (N, N)
+        args: 包含 pp_k (阶数) 和 eps (防止除零)
+    Returns:
+        nodes_features: 正交化后的特征序列, size = (N, args.pp_k + 1, d)
+    """
+    print(f"Krylov Orthogonal Tokenizating (K={args.pp_k})...")
+    
+    N, D = features.shape
+    K = args.pp_k
+    eps = 1e-9 # 极小值防止除零
+    
+    # 初始化 Token 列表，Q[k] 存储第 k 阶的正交 Token [N, D]
+    Q = []
+    
+    # --- 0阶 Token: 原始特征归一化 ---
+    # 对每个节点的特征向量进行 L2 归一化，作为起始正交基
+    q0 = F.normalize(features, p=2, dim=-1)
+    Q.append(q0)
+    
+    # --- 1到K阶 Token: Arnoldi 迭代过程 ---
+    for k in range(1, K + 1):
+        # 1. 基础传播: V_next = A * Q_prev
+        # 注意：这里 Q[-1] 是上一阶已经正交化并归一化后的特征
+        if adj.is_sparse:
+            v_next = torch.sparse.mm(adj, Q[-1])
+        else:
+            v_next = torch.mm(adj, Q[-1])
+            
+        # 2. Modified Gram-Schmidt 正交化过程
+        # 减去当前向量在之前所有基向量上的分量，只留下“纯增量”
+        for q_prev in Q:
+            # 计算节点维度的投影系数 (Node-wise Inner Product)
+            # h[i] = v_next[i] · q_prev[i]
+            h = torch.sum(v_next * q_prev, dim=-1, keepdim=True) # shape: (N, 1)
+            
+            # 从 v_next 中剔除冗余分量 (Orthogonal Projection)
+            v_next = v_next - 1 * h * q_prev 
+            
+        # 3. 归一化 (Normalization)
+        # 此时 v_next 已经与 Q 中所有向量正交，将其单位化
+        q_k = v_next / (torch.norm(v_next, p=2, dim=-1, keepdim=True) + eps)
+        # 保留其原始能量的相对比例
+        # scale = torch.norm(v_next, p=2, dim=-1, keepdim=True)
+        # q_k = v_next / (scale + eps) * torch.tanh(scale) # 使用 tanh 限制极值，但保留模长趋势
+        Q.append(q_k)
+        
+    # 将列表堆叠成 [N, K+1, D]
+    nodes_features = torch.stack(Q, dim=1)
+    
+    # 验证步骤 (可选，调试用)：计算 mean_sim
+    # check_sim = check_token_similarity(nodes_features)
+    # print(f"Orthogonalized mean_sim: {check_sim:.4f}")
+    
+    return nodes_features
+def mixed_krylov_tokenization(features, adj, args):
+    """
+    方案 D: 同时保留语义(低频)和正交拓扑(中高频)
+    """
+    N, D = features.shape
+    K = args.pp_k
+    
+    # 通道 1: 原始 Nagphormer Token (平滑/低频)
+    smooth_tokens = [features]
+    tmp = features
+    for _ in range(K):
+        # (1-alpha) * torch.mm(adj, features) + alpha * x_0
+        tmp = (1-args.progregate_alpha) *  torch.sparse.mm(adj, tmp) + args.progregate_alpha * tmp # 这里可以带 alpha
+        smooth_tokens.append(tmp)
+    
+    # 通道 2: Krylov 正交残差 Token (捕捉异常突变)
+    # 我们在前一步得到的 smooth_tokens 基础上，计算每一跳的“正交增量”
+    orth_residuals = [torch.zeros_like(features)] # 0-hop 没有残差
+    for k in range(1, K + 1):
+        # 计算第 k 阶平滑特征相对于第 k-1 阶的纯正交增量
+        v_k = smooth_tokens[k]
+        q_prev = F.normalize(smooth_tokens[k-1], p=2, dim=-1)
+        h = torch.sum(v_k * q_prev, dim=-1, keepdim=True)
+        # 这里的 residual 就是被平滑掉的那部分“有用”的差异
+        residual = v_k - h * q_prev 
+        orth_residuals.append(residual)
+        
+    # 将两者融合。方案：cat 还是 stack？
+    # 建议方案：让序列长度翻倍，或者维度翻倍。
+    # 这里我们尝试将 [N, K+1, D] 的两个序列拼接成 [N, K+1, 2*D]
+    t1 = torch.stack(smooth_tokens, dim=1)
+    t2 = torch.stack(orth_residuals, dim=1)
+    
+    # 关键创新：给正交部分一个可学习的权重
+    combined = torch.cat([t1, t2], dim=-1) # args.orth_weight 初始 0.1
+    return combined
+
 
 class PolynomialDecayLR(_LRScheduler):
 
