@@ -1,0 +1,11 @@
+dataset/*
+GGAD/dataset/*
+
+__pycache__/
+
+wandb/
+
+sweep_config/
+pretrain/
+logs/
+pytorch_models/
