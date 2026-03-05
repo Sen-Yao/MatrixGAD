@@ -1,4 +1,5 @@
 import torch.nn as nn
+import numpy as np
 
 from model import Model
 from MatrixGAD import MatrixGAD
@@ -323,25 +324,83 @@ def train(args):
 
             if args.model_type == "MatrixGAD":
                 all_batched_logits = []
+                all_batched_embs = []  # 【新增】收集所有测试节点的 Embedding
+                
                 with torch.no_grad():
                     for _, item in enumerate(test_data_loader):
                         concated_input_features = item[0].to(device)
                         labels = item[1].to(device)
-                        emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring = model(concated_input_features, None, None, None,
-                                                                                train_flag, args)
-                        all_batched_logits.append(logits.squeeze(0))
-                    # Concatenate all batched logits
+                        # 注意解包数量与模型返回值对齐 (7个返回值)
+                        emb, emb_combine, logits_out, outlier_emb, _, loss_rec, loss_ring = model(
+                            concated_input_features, None, None, None, train_flag, args)
+                        
+                        all_batched_logits.append(logits_out.squeeze(0))
+                        all_batched_embs.append(emb.squeeze(0)) # 【新增】提取测试集的最终特征表达
+
+                    # 拼接所有批次结果
                     concatenated_logits = torch.cat(all_batched_logits, dim=0)
-                    logits = np.squeeze(concatenated_logits.cpu().detach().numpy())
-                    auc = roc_auc_score(ano_label[idx_test], logits)
-                    ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
+                    concatenated_embs = torch.cat(all_batched_embs, dim=0)
+                    
+                    logits_np = np.squeeze(concatenated_logits.cpu().detach().numpy())
+                    auc = roc_auc_score(ano_label[idx_test], logits_np)
+                    ap = average_precision_score(ano_label[idx_test], logits_np, average='macro', pos_label=1)
+                    
+                    # ==========================================
+                    # 【核心】诊断指标计算块 (Diagnostic Probes)
+                    # ==========================================
+                    # 划分测试集中的 "真实正常" vs "真实异常"
+                    test_labels = ano_label[idx_test]
+                    norm_mask = (test_labels == 0)
+                    abnorm_mask = (test_labels == 1)
+                    
+                    logits_tensor = concatenated_logits.cpu().squeeze()
+                    embs_tensor = concatenated_embs.cpu()
+                    
+                    # 取出对应的 Logits 和 Embeddings
+                    norm_logits = logits_tensor[norm_mask]
+                    abnorm_logits = logits_tensor[abnorm_mask]
+                    norm_embs = embs_tensor[norm_mask]
+                    abnorm_embs = embs_tensor[abnorm_mask]
+
+                    # 探针 1：预测置信度与翻转诊断 (Logit Analysis)
+                    logit_margin = (abnorm_logits.mean() - norm_logits.mean()).item()
+                    logit_std = logits_tensor.std().item()
+
+                    # 探针 2：表征塌缩监控 (Embedding Collapse)
+                    # 采样最多1000个节点计算两两余弦相似度（防OOM）
+                    num_samples = min(norm_embs.size(0), 1000)
+                    sampled_norm_embs = torch.nn.functional.normalize(norm_embs[:num_samples], p=2, dim=1)
+                    cos_sim_matrix = torch.mm(sampled_norm_embs, sampled_norm_embs.t())
+                    mask = torch.eye(num_samples, dtype=torch.bool).flatten()
+                    avg_cos_sim = cos_sim_matrix.flatten()[~mask].mean().item()
+
+                    # 探针 3：真实流形分离度 (Euclidean Separation)
+                    norm_center = norm_embs.mean(dim=0)
+                    abnorm_center = abnorm_embs.mean(dim=0)
+                    center_dist = torch.norm(norm_center - abnorm_center, p=2).item()
+
+                    # 将诊断指标推送到 WandB
+                    wandb.log({
+                        "AUC": auc, 
+                        "AP": ap,
+                        "Diag/Logit_Margin": logit_margin,
+                        "Diag/Logit_Std": logit_std,
+                        "Diag/Emb_Cos_Sim": avg_cos_sim,
+                        "Diag/Emb_Center_Dist": center_dist
+                    }, step=epoch)
+                    
+                    # 打印诊断结果供 debug
+                    print(f"\n[Epoch {epoch}] Diagnostic Metrics:")
+                    print(f"  AUC: {auc:.4f} | AP: {ap:.4f}")
+                    print(f"  Logit_Margin: {logit_margin:.4f} | Logit_Std: {logit_std:.4f}")
+                    print(f"  Emb_Cos_Sim: {avg_cos_sim:.4f} | Emb_Center_Dist: {center_dist:.4f}")
             else: 
                 emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, _, con_loss, proj_loss, reconstruction_loss = model(concated_input_features, adj, normal_for_generation_idx, normal_for_train_idx,
                                                                         train_flag, args)
                 logits = np.squeeze(logits[:, idx_test, :].cpu().detach().numpy())
-            auc = roc_auc_score(ano_label[idx_test], logits)
-            ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
-            wandb.log({"AUC": auc, "AP": ap}, step=epoch)
+                auc = roc_auc_score(ano_label[idx_test], logits)
+                ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
+                wandb.log({"AUC": auc, "AP": ap}, step=epoch)
             
             # 检查是否为最佳模型
             if auc > best_AUC and ap > best_AP:

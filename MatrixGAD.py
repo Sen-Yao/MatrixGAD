@@ -185,29 +185,29 @@ class MatrixGAD(nn.Module):
         loss_rec = torch.tensor(0.0, device=self.device)
         loss_ring = torch.tensor(0.0, device=self.device)
         if train_flag:
-            # --- Idea 3 实施 ---
-            
             # 2. 提取正常节点的 Tokens
-            # normal_for_train_idx: 正常节点的索引张量
-            normal_tokens = input_tokens[normal_for_train_idx] # [N_normal, 6, D]
+            normal_tokens = input_tokens[normal_for_train_idx]
             
-            # 3. 构造错配
-            # 保持 T0 (Identity) 不动，滚动 T1~T5 (Topology)
-            # 这创造了 "披着羊皮(Identity) 的狼
-            rolled_idx = torch.roll(torch.arange(normal_tokens.size(0)), shifts=1)
+            # === 改进 A：随机移位距离，打破固定模式震荡 ===
+            # 将 shift 从固定的 1 改为随机值，增加"对抗性负例"的多样性
+            max_shift = max(1, normal_tokens.size(0) // 2)
+            shift = torch.randint(1, max_shift + 1, (1,)).item()
+            rolled_idx = torch.roll(torch.arange(normal_tokens.size(0)), shifts=shift)
             
             mismatched_tokens = normal_tokens.clone()
-            # 关键步骤：拓扑特征移位
-            # 注意：需确保 rolled_idx 在同一设备上
             rolled_idx = rolled_idx.to(self.device)
-            mismatched_tokens[:, 1:, :] = normal_tokens[rolled_idx, 1:, :]
-            # 4. 编码正常样本与伪异常样本
-            # 正常样本编码 (复用已计算的 emb_all 或重新计算以保持梯度独立)
-            # 建议：为了清晰和梯度隔离，重新通过 TransformerEncoder 计算
-            normal_emb = self.TransformerEncoder(normal_tokens).squeeze(0) # [N_normal, D]
+            mismatched_tokens[:, 1:, :] = normal_tokens[rolled_idx, 1:, :] # T1~T5拓扑特征错位
+            # 4. 编码
+            normal_emb = self.TransformerEncoder(normal_tokens).squeeze(0)
+            outlier_emb = self.TransformerEncoder(mismatched_tokens).squeeze(0)
+            # === 改进 B：流形紧凑约束 (Manifold Compactness) ===
+            # 计算正常样本的局部质心，拉近它们之间的距离，稳住决策底盘
+            center = normal_emb.mean(dim=0, keepdim=True).detach() # detach防中心点过度漂移
+            loss_compactness = torch.mean(torch.norm(normal_emb - center, p=2, dim=1))
             
-            # 伪异常样本编码
-            outlier_emb = self.TransformerEncoder(mismatched_tokens).squeeze(0) # [N_normal, D]
+            # 复用 loss_ring 接口传递给外部
+            loss_ring = loss_compactness
+            loss_rec = torch.tensor(0.0, device=self.device)
             # 5. 构建训练数据
             # 正常样本 label=0, 错配样本 label=1
             emb_combine = torch.cat((normal_emb, outlier_emb), dim=0) # [2*N_normal, D]
