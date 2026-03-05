@@ -209,12 +209,12 @@ def train(args):
                     # BCE loss
                 lbl = torch.unsqueeze(torch.cat(
                     (torch.zeros(len(local_normal_for_train_idx)), torch.ones(len(outlier_emb)))),
-                    1).unsqueeze(0)
+                    1)
                 lbl = lbl.to(device)  # 将标签移动到指定设备
                 loss_bce = b_xent(logits, lbl)
                 loss_bce = torch.mean(loss_bce)
 
-                diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
+                # diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
                 # loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
 
                 loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring
@@ -257,7 +257,7 @@ def train(args):
             # BCE loss
             lbl = torch.unsqueeze(torch.cat(
                 (torch.zeros(len(normal_for_train_idx)), torch.ones(len(outlier_emb)))),
-                1).unsqueeze(0)
+                1)
             lbl = lbl.to(device)  # 将标签移动到指定设备
 
             loss_bce = b_xent(logits, lbl)

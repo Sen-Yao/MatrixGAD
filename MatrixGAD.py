@@ -113,277 +113,122 @@ class EncoderLayer(nn.Module):
 class MatrixGAD(nn.Module):
     def __init__(self, n_in, n_h, activation, args):
         super(MatrixGAD, self).__init__()
-
-        # 设置设备
         self.device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() and args.device >= 0 else 'cpu')
         self.args = args
-
-        # 设置批次大小
-        self.batchsize = getattr(args, 'batchsize', None)
-
+        # --- 1. 保留判别器与投影层 ---
         self.fc1 = nn.Linear(n_h, int(n_h / 2), bias=False)
         self.fc2 = nn.Linear(int(n_h / 2), int(n_h / 4), bias=False)
-        self.fc3 = nn.Linear(int(n_h / 4), 1, bias=False)
-        self.fc4 = nn.Linear(n_h, n_h, bias=False)
+        self.fc3 = nn.Linear(int(n_h / 4), 1, bias=False) # 输出 logits
         self.act = nn.ReLU()
-
-        self.n_in = n_in
+        # --- 2. Tokenizer 定义 ---
+        # T0: 属性特征专用
+        self.id_projection = nn.Linear(n_in, args.embedding_dim)
+        # T1, T3, T4, T5: 残差/拓扑特征
+        self.res_projection = nn.Linear(n_in, args.embedding_dim)
+        # T2: 度数特征 (假设输入是标量)
+        self.deg_encoder = nn.Sequential(
+            nn.Linear(1, args.embedding_dim),
+            nn.GELU(),
+            nn.Linear(args.embedding_dim, args.embedding_dim)
+        )
+        # --- 3. Transformer Encoder ---
         self.token_length = 6
-        # self.token_length = args.pp_k * 2 + 1
-
-        # Graph Transformer
         encoders = [EncoderLayer(args.embedding_dim, args.GT_ffn_dim, args.GT_dropout, args.GT_attention_dropout, args.GT_num_heads)
                     for _ in range(args.GT_num_layers)]
         self.layers = nn.ModuleList(encoders)
         self.final_ln = nn.LayerNorm(args.embedding_dim)
-        self.read_out = nn.Linear(args.embedding_dim, args.embedding_dim)
-
-        self.token_decoder = nn.Sequential(
-            nn.Linear(args.embedding_dim, args.embedding_dim),
-            nn.ReLU(),
-            nn.Linear(args.embedding_dim, self.token_length * self.n_in)
-        )
-
-        # 重构损失函数
-        self.recon_loss_fn = nn.MSELoss()
-
-        # 投影层：将重构误差从2*n_in维度投影到embedding_dim维度
-        self.reconstruction_proj = nn.Sequential(
-            nn.Linear(self.token_length * n_in, args.embedding_dim),
-            nn.ReLU(),
-            nn.Linear(args.embedding_dim, args.embedding_dim)
-        )
-
-        # 1. 针对原始特征的投影
-        self.id_projection = nn.Linear(n_in, args.embedding_dim)
-        # 2. 针对残差类算子 (T1, T3, T4, T5) 的投影
-        self.res_projection = nn.Linear(n_in, args.embedding_dim)
-        # 3. 针对度数特征 (T2) 的专用编码器
-        self.deg_encoder = nn.Sequential(
-            nn.Linear(1, args.embedding_dim), # 输入是 1 维！
-            nn.GELU(),
-            nn.Linear(args.embedding_dim, args.embedding_dim)
-        )
-
-        # Token 位置编码
+        # Embeddings
         self.type_embedding = nn.Parameter(torch.zeros(1, self.token_length + 1, args.embedding_dim))
         nn.init.xavier_uniform_(self.type_embedding)
-
         self.cls_token = nn.Parameter(torch.zeros(1, 1, args.embedding_dim))
-
-        self.self_attention_norm = nn.LayerNorm(args.embedding_dim)
-
-        # 将模型移动到指定设备
+        # --- 4. 移除不再需要的重构模块 ---
+        # 删除了 token_decoder, reconstruction_proj 等
         self.to(self.device)
-    
-    def TransformerEncoder(self, tokens, args):
+    def TransformerEncoder(self, tokens):
         """
-        Inputs:
-            - tokens: 输入节点的 tokens 序列，形状 [batch_size, pp_k+1, feature_dim]
-        Outputs:
-            - emb: 输入节点的编码结果，形状 [1, batch_size, embedding_dim]
+        输入: tokens [N, 6, D_in]
+        输出: emb [1, N, D_emb]
         """
-            # 分别投影（假设索引 0 是 ID，1,3,4,5 是残差，2 是度数）
-        t0 = self.id_projection(tokens[:, 0:1, :])      # [N, 1, D]
-        t1 = self.res_projection(tokens[:, 1:2, :])     # [N, 1, D]
-        t2 = self.deg_encoder(tokens[:, 2:3, 0:1].reshape(-1, 1)).unsqueeze(1)        # [N, 1, 1]
-        t3 = self.res_projection(tokens[:, 3:4, :])     # [N, 1, D]
-        t4 = self.res_projection(tokens[:, 4:5, :])     # [N, 1, D]
-        t5 = self.res_projection(tokens[:, 5:6, :])     # [N, 1, D]
-
+        # 分别投影
+        t0 = self.id_projection(tokens[:, 0:1, :])
+        t1 = self.res_projection(tokens[:, 1:2, :])
+        # 注意：T2 度数特征处理，需要确保输入维度正确
+        t2_input = tokens[:, 2:3, 0:1].reshape(-1, 1) # 取标量
+        t2 = self.deg_encoder(t2_input).unsqueeze(1)
+        t3 = self.res_projection(tokens[:, 3:4, :])
+        t4 = self.res_projection(tokens[:, 4:5, :])
+        t5 = self.res_projection(tokens[:, 5:6, :])
         cls_tokens = self.cls_token.expand(tokens.shape[0], -1, -1)
-
         
-        # 拼接并加上身份编码
+        # 拼接 [CLS, T0, T1, T2, T3, T4, T5]
         emb = torch.cat([cls_tokens, t0, t1, t2, t3, t4, t5], dim=1)
-        # emb = self.self_attention_norm(emb)
-        emb = emb + self.type_embedding                 # Type embedding 在这里发挥“路标”作用
-        for i, l in enumerate(self.layers):
-            emb, current_attention_weights = self.layers[i](emb)
-            if i == len(self.layers) - 1: # 拿到最后一层的注意力
-                attention_weights = current_attention_weights
-                # 聚合多头注意力
-                agg_attention_weights = torch.mean(attention_weights, dim=1)
-                # agg_attention_weights: [N, args.pp_k+1, args.pp_k+1]
+        emb = emb + self.type_embedding
+        for layer in self.layers:
+            emb, _ = layer(emb)
+        
         emb = self.final_ln(emb)
-
-        # attention_scores: [N, args.pp_k+1], 表示每个节点的自身特征 (0-hop) 对每个后续 hop 的注意力分数
-        attention_scores = agg_attention_weights[:, 0, :]
-
-        # 基于 attention_scores 进行池化，得到最终编码结果
-        # emb: [1, N, embedding_dim]
-        # emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
-        final_h = emb[:, 0, :]
-        # print("Entropy: ", get_attention_entropy(attention_weights))
-        return final_h.unsqueeze(0)
-
+        final_h = emb[:, 0, :] # 取 CLS token
+        return final_h.unsqueeze(0) # [1, N, D]
     def forward(self, input_tokens, adj, _, normal_for_train_idx, train_flag, args, sparse=False):
-
-        # input_tokens: (N, args.pp_k+1, d)
-        
-        emb = self.TransformerEncoder(input_tokens, args)
-
-        # 生成全局中心点
-        h_mean = torch.mean(emb, dim=1, keepdim=True)
-
-        outlier_emb = None
+        """
+        核心逻辑修改：Idea 3 - Context-Ego Mismatching
+        """
+        # 1. 编码所有节点 (用于测试或无监督特征提取)
+        # input_tokens: [N, 6, D]
+        emb_all = self.TransformerEncoder(input_tokens) # [1, N, D]
+        # 初始化返回变量
+        logits = None
         emb_combine = None
-        noised_normal_for_generation_emb = None
-
-        gna_loss = torch.tensor(0.0, device=emb.device)
-        proj_loss = torch.tensor(0.0, device=emb.device)
-        uniformity_loss = torch.tensor(0.0, device=emb.device)
-        loss_ring = torch.tensor(0.0, device=emb.device)
-        con_loss = torch.tensor(0.0, device=emb.device)
-        loss_rec = torch.tensor(0.0, device=emb.device)
+        labels = None
+        # 占位符，保持接口兼容
+        outlier_emb = None
+        loss_rec = torch.tensor(0.0, device=self.device)
+        loss_ring = torch.tensor(0.0, device=self.device)
         if train_flag:
-            # start_time = time.time()
-            # 高效重排
-            perm = torch.randperm(normal_for_train_idx.size(0), device=normal_for_train_idx.device)
-            normal_for_train_idx = normal_for_train_idx[perm]
-            # print(f"time for shuffle:{time.time() - start_time}")
-            normal_for_generation_idx = normal_for_train_idx[: int(len(normal_for_train_idx) * args.sample_rate)]            
-            normal_for_generation_emb = emb[:, normal_for_generation_idx, :]
-            # print(f"time for normal_for_generation_emb:{time.time() - start_time}")
-            # Noise
-            noise = torch.randn(normal_for_generation_emb.size(), device=self.device) * args.var + args.mean
-            noised_normal_for_generation_emb = normal_for_generation_emb + noise
-            # print(f"time for noise:{time.time() - start_time}")
-
-            # 重构学习
-            reconstructed_tokens = self.token_decoder(emb).squeeze(0)  # [num_nodes, self.token_length * n_in]
-            reconstruction_error = reconstructed_tokens - input_tokens.view(-1, self.token_length * self.n_in)
-            # Project reconstruction error to embedding dimension
-            reconstruction_error_proj = self.reconstruction_proj(reconstruction_error[normal_for_generation_idx, :])
-
-            # Ablation study:
-            if args.ablation_random_dir:
-                # 计算原始扰动向量的模长 (Magnitude)
-                # dim=1 表示计算每个样本向量的范数，keepdim=True 保持形状为 (Batch, 1) 以便广播
-                norms = torch.norm(reconstruction_error_proj, p=2, dim=1, keepdim=True)
-                
-                # 生成同维度的随机向量 (Random Direction)
-                # 从标准正态分布采样
-                random_vec = torch.randn_like(reconstruction_error_proj)
-                
-                # 将随机向量归一化为单位向量 (Unit Vector)
-                random_dir = torch.nn.functional.normalize(random_vec, p=2, dim=1)
-                
-                # 赋予随机方向以原始模长
-                reconstruction_error_proj = norms * random_dir
-
-            outlier_emb = normal_for_generation_emb + args.outlier_beta * reconstruction_error_proj
-            outlier_emb = outlier_emb.squeeze(0)
-
-            # 中心点对齐损失，鼓励离群点距离全局中心的距离保持在一个 ring 内
-            # 计算离群点嵌入与全局中心的距离
-            outlier_to_center_dist = torch.norm(outlier_emb - h_mean.squeeze(0), p=2, dim=1)
-            # 只有超过 confidence_margin 的距离才会产生损失
-            ring_out_range_loss = torch.relu(args.ring_R_min - outlier_to_center_dist)
-            ring_in_range_loss = torch.relu(outlier_to_center_dist - args.ring_R_max)
-
-            loss_ring = torch.mean(ring_out_range_loss + ring_in_range_loss)
-            # 将重构后的 tokens 再编码为 embedding
-            reconstructed_tokens_vector = torch.reshape(reconstructed_tokens, (-1, self.token_length, self.n_in))
-            reencoded_emb = self.TransformerEncoder(reconstructed_tokens_vector, args)[:, normal_for_generation_idx, :].detach().squeeze(0)
-            loss_rec = self.weight_compute_rec_loss(input_tokens, reconstructed_tokens, normal_for_generation_emb, reencoded_emb, normal_for_generation_idx, args)
-
-            emb_combine = torch.cat((emb[:, normal_for_train_idx, :], torch.unsqueeze(outlier_emb, 0)), 1)
-
-            f_1 = self.fc1(emb_combine)
+            # --- Idea 3 实施 ---
+            
+            # 2. 提取正常节点的 Tokens
+            # normal_for_train_idx: 正常节点的索引张量
+            normal_tokens = input_tokens[normal_for_train_idx] # [N_normal, 6, D]
+            
+            # 3. 构造错配
+            # 保持 T0 (Identity) 不动，滚动 T1~T5 (Topology)
+            # 这创造了 "披着羊皮(Identity) 的狼
+            rolled_idx = torch.roll(torch.arange(normal_tokens.size(0)), shifts=1)
+            
+            mismatched_tokens = normal_tokens.clone()
+            # 关键步骤：拓扑特征移位
+            # 注意：需确保 rolled_idx 在同一设备上
+            rolled_idx = rolled_idx.to(self.device)
+            mismatched_tokens[:, 1:, :] = normal_tokens[rolled_idx, 1:, :]
+            # 4. 编码正常样本与伪异常样本
+            # 正常样本编码 (复用已计算的 emb_all 或重新计算以保持梯度独立)
+            # 建议：为了清晰和梯度隔离，重新通过 TransformerEncoder 计算
+            normal_emb = self.TransformerEncoder(normal_tokens).squeeze(0) # [N_normal, D]
+            
+            # 伪异常样本编码
+            outlier_emb = self.TransformerEncoder(mismatched_tokens).squeeze(0) # [N_normal, D]
+            # 5. 构建训练数据
+            # 正常样本 label=0, 错配样本 label=1
+            emb_combine = torch.cat((normal_emb, outlier_emb), dim=0) # [2*N_normal, D]
+            
+            # 标签构建
+            labels = torch.cat((
+                torch.zeros(normal_emb.size(0), device=self.device),
+                torch.ones(outlier_emb.size(0), device=self.device)
+            ), dim=0).unsqueeze(1) # [2*N_normal, 1]
+            # 6. 分类器前向传播
+            f_1 = self.act(self.fc1(emb_combine))
+            f_2 = self.act(self.fc2(f_1))
+            logits = self.fc3(f_2) # [2*N_normal, 1]
         else:
-            f_1 = self.fc1(emb)
-        f_1 = self.act(f_1)
-        f_2 = self.fc2(f_1)
-        f_2 = self.act(f_2)
-        logits = self.fc3(f_2)
-        emb = emb.clone()
-
-        # gna_loss = torch.tensor(0.0, device=emb.device)
-        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring
-
-    def compute_rec_loss(self, input_tokens, reconstructed_tokens, normal_for_generation_emb, reencoded_emb, normal_for_generation_idx):
-        """
-        计算 Token 空间和 Embedding 空间的重构损失
-        Args:
-            input_tokens: 原始采样的 Token 序列
-            reconstructed_tokens： 经过解码器重构的 Token 序列
-            emb: 第一次编码的嵌入结果
-            reencoded_emb: 将重构 Token 序列进行二次编码的嵌入结果
-        Returns:
-            loss_rec: 重构损失值
-        """
-        token_rec_loss = self.recon_loss_fn(reconstructed_tokens, input_tokens.view(-1, self.token_length * self.n_in))
-        # 计算距离
-        emb_rec_loss = torch.mean(torch.norm(normal_for_generation_emb.squeeze(0) - reencoded_emb, dim=-1))  # [N]
-        loss_rec = self.args.lambda_rec_tok * token_rec_loss + self.args.lambda_rec_emb * emb_rec_loss
-        return loss_rec
-    
-    def weight_compute_rec_loss(self, input_tokens, reconstructed_tokens, normal_for_generation_emb, reencoded_emb, normal_for_generation_idx, args):
-        # input_tokens 原形状: (N, 6, n_in)
-        # reconstructed_tokens 原形状: (N, 6 * n_in) -> 需 reshape
-        N = input_tokens.size(0)
-        recon_reshaped = reconstructed_tokens.view(N, 6, self.n_in)
-        
-        # 1. 计算每一位的 MSE
-        # t0_loss: 原始特征的重建损失 (最重要的锚点)
-        t0_loss = self.recon_loss_fn(recon_reshaped[:, 0, :], input_tokens[:, 0, :])
-        
-        # tr_loss: 其他算子 (T1~T5) 的重建损失
-        tr_loss = self.recon_loss_fn(recon_reshaped[:, 1:, :], input_tokens[:, 1:, :])
-        
-        # 2. 加权组合 (建议 gamma 设为 0.1 或更低)
-        token_rec_loss = t0_loss + args.rec_gamma * tr_loss
-        
-        # 3. 嵌入空间重构损失保持不变
-        emb_rec_loss = torch.mean(torch.norm(normal_for_generation_emb.squeeze(0) - reencoded_emb, dim=-1))
-        
-        loss_rec = self.args.lambda_rec_tok * token_rec_loss + self.args.lambda_rec_emb * emb_rec_loss
-        return loss_rec
-
-
-    # InfoNCE uniformity loss - 推开不同正常节点间的距离
-    def compute_infoNCE_uniformity_loss(self, emb, normal_for_train_idx, args):
-        """
-        计算InfoNCE均匀性损失，推开不同正常节点在嵌入空间中的距离
-        Args:
-            emb: [1, N, embedding_dim] - 所有节点的嵌入表征
-            normal_for_train_idx: 训练时使用的正常节点索引
-            args: 包含GNA_temp等超参数的配置
-        Returns:
-            uniformity_loss: InfoNCE均匀性损失
-        """
-        # 提取正常节点的嵌入: [num_normal, embedding_dim]
-        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, embedding_dim]
-        num_normal = normal_emb.size(0)
-        
-        # 如果正常节点数量少于2，无法计算InfoNCE损失
-        if num_normal < 2:
-            return torch.tensor(0.0, device=emb.device)
-        
-        # L2 归一化，便于计算余弦相似度
-        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)  # [num_normal, embedding_dim]
-        
-        # 计算所有节点对之间的余弦相似度矩阵
-        # similarity_matrix[i,j] = cos_sim(node_i, node_j)
-        similarity_matrix = torch.mm(normal_emb_norm, normal_emb_norm.t())  # [num_normal, num_normal]
-        
-        # 应用温度参数
-        similarity_matrix = similarity_matrix / args.GNA_temp
-        
-        # 创建掩码，排除对角线元素（自己与自己的相似度）
-        mask = torch.eye(num_normal, device=emb.device, dtype=torch.bool)
-        
-        # 并行计算InfoNCE损失
-        # 对于每个锚点i，我们希望它与其他所有节点的相似度都尽可能小
-        # 使用掩码将对角线元素设为极小值，这样就不会影响logsumexp计算
-        similarity_matrix_masked = similarity_matrix.masked_fill(mask, float('-inf'))
-
-        # 并行计算所有节点的logsumexp值
-        # 对每一行计算logsumexp，得到每个节点与其他节点的相似度之和
-        log_sum_exp_values = torch.logsumexp(similarity_matrix_masked, dim=1)  # [num_normal]
-
-        # 平均化损失
-        uniformity_loss = log_sum_exp_values.mean()
-        
-        return uniformity_loss
+            # 测试模式：对所有节点进行预测
+            f_1 = self.act(self.fc1(emb_all.squeeze(0)))
+            f_2 = self.act(self.fc2(f_1))
+            logits = self.fc3(f_2) # [N, 1]
+            # 测试时不需要 labels 和 emb_combine
+            labels = None
+            emb_combine = emb_all.squeeze(0)
+        # 返回接口保持一致性
+        # 注意：外部训练循环需自行计算 BCELoss(logits, labels)
+        return emb_all, emb_combine, logits, outlier_emb, None, loss_rec, loss_ring
