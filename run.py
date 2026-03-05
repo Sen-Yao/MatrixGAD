@@ -18,7 +18,7 @@ import wandb
 from visualization import create_tsne_visualization, visualize_attention_weights
 from utils import send_notification
 
-from playground import check_token_collapse
+from playground import *
 
 
 # os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -62,7 +62,9 @@ def train(args):
     else:
         adj, features, labels, all_idx, idx_train, idx_val, \
         idx_test, ano_label, str_ano_label, attr_ano_label, normal_for_train_idx, normal_for_generation_idx = load_mat(args.dataset, args.train_rate, 0.1, args=args)
-
+        stats = calculate_cycle_density(adj)
+        print(f"Cycle Density: {stats['cycle_density']:.4f}")
+        
         if args.dataset in ['Amazon', 'tf_finace', 'reddit', 'elliptic']:
             features, _ = preprocess_features(features)
         else:
@@ -103,7 +105,7 @@ def train(args):
         # Initialize model and optimiser
 
         if args.model_type == 'MatrixGAD':
-            concated_input_features = krylov_orthogonal_tokenization(features.squeeze(0), adj.squeeze(0), args)
+            concated_input_features = multi_statistics_operator_tokenization(features.squeeze(0), adj.squeeze(0), args)
             print("check_token_collapse!:", check_token_collapse(concated_input_features))
             model = MatrixGAD(ft_size, args.embedding_dim, 'prelu', args)
         elif args.model_type == 'SGT':
@@ -445,6 +447,7 @@ if __name__ == "__main__":
     parser.add_argument('--reconstruction_loss_weight', type=float, default=1.0)
     parser.add_argument('--ring_loss_weight', type=float, default=1.0)
 
+    parser.add_argument('--rec_gamma', type=float, default=0.1)
     parser.add_argument('--lambda_rec_tok', type=float, default=1.0)
     parser.add_argument('--lambda_rec_emb', type=float, default=0.1)
     

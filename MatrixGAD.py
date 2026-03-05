@@ -6,7 +6,7 @@ import time
 
 from check_gpu_memory import print_gpu_memory_usage, print_tensor_memory, clear_gpu_memory
 
-from playground import check_token_collapse
+from playground import *
 
 class FeedForwardNetwork(nn.Module):
     def __init__(self, hidden_size, ffn_size, dropout_rate):
@@ -110,71 +110,6 @@ class EncoderLayer(nn.Module):
 
         return x, attention_weights
 
-class GCN(nn.Module):
-    def __init__(self, in_ft, out_ft, act, bias=True):
-        super(GCN, self).__init__()
-        self.fc = nn.Linear(in_ft, out_ft, bias=False)
-        self.act = nn.PReLU() if act == 'prelu' else act
-        if bias:
-            self.bias = nn.Parameter(torch.FloatTensor(out_ft))
-            self.bias.data.fill_(0.0)
-        else:
-            self.register_parameter('bias', None)
-
-        for m in self.modules():
-            self.weights_init(m)
-
-    def weights_init(self, m):
-        if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight.data)
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
-
-    def forward(self, seq, adj, sparse=False):
-        seq_fts = self.fc(seq)
-        if sparse:
-            out = torch.unsqueeze(torch.spmm(adj, torch.squeeze(seq_fts, 0)), 0)
-        else:
-            out = torch.bmm(adj, seq_fts)
-        if self.bias is not None:
-            out += self.bias
-
-        return self.act(out)
-
-
-class Discriminator(nn.Module):
-    def __init__(self, n_h, negsamp_round):
-        super(Discriminator, self).__init__()
-        self.f_k = nn.Bilinear(n_h, n_h, 1)
-
-        for m in self.modules():
-            self.weights_init(m)
-
-        self.negsamp_round = negsamp_round
-
-    def weights_init(self, m):
-        if isinstance(m, nn.Bilinear):
-            torch.nn.init.xavier_uniform_(m.weight.data)
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
-
-    def forward(self, c, h_pl):
-        scs = []
-        # positive
-        scs.append(self.f_k(h_pl, c))
-
-        # negative
-        c_mi = c
-        for _ in range(self.negsamp_round):
-            c_mi = torch.cat((c_mi[-2:-1, :], c_mi[:-1, :]), 0)
-            scs.append(self.f_k(h_pl, c_mi))
-
-        logits = torch.cat(tuple(scs))
-
-        return logits
-
-
-
 class MatrixGAD(nn.Module):
     def __init__(self, n_in, n_h, activation, args):
         super(MatrixGAD, self).__init__()
@@ -185,9 +120,6 @@ class MatrixGAD(nn.Module):
 
         # 设置批次大小
         self.batchsize = getattr(args, 'batchsize', None)
-        
-        self.gcn1 = GCN(args.embedding_dim, args.embedding_dim, activation)
-        self.gcn2 = GCN(args.embedding_dim, args.embedding_dim, activation)
 
         self.fc1 = nn.Linear(n_h, int(n_h / 2), bias=False)
         self.fc2 = nn.Linear(int(n_h / 2), int(n_h / 4), bias=False)
@@ -196,6 +128,8 @@ class MatrixGAD(nn.Module):
         self.act = nn.ReLU()
 
         self.n_in = n_in
+        self.token_length = 6
+        # self.token_length = args.pp_k * 2 + 1
 
         # Graph Transformer
         encoders = [EncoderLayer(args.embedding_dim, args.GT_ffn_dim, args.GT_dropout, args.GT_attention_dropout, args.GT_num_heads)
@@ -204,12 +138,10 @@ class MatrixGAD(nn.Module):
         self.final_ln = nn.LayerNorm(args.embedding_dim)
         self.read_out = nn.Linear(args.embedding_dim, args.embedding_dim)
 
-        self.token_projection = nn.Linear(self.n_in, args.embedding_dim)
-
         self.token_decoder = nn.Sequential(
             nn.Linear(args.embedding_dim, args.embedding_dim),
             nn.ReLU(),
-            nn.Linear(args.embedding_dim, (args.pp_k+1) * self.n_in)
+            nn.Linear(args.embedding_dim, self.token_length * self.n_in)
         )
 
         # 重构损失函数
@@ -217,23 +149,55 @@ class MatrixGAD(nn.Module):
 
         # 投影层：将重构误差从2*n_in维度投影到embedding_dim维度
         self.reconstruction_proj = nn.Sequential(
-            nn.Linear((args.pp_k+1) * n_in, args.embedding_dim),
+            nn.Linear(self.token_length * n_in, args.embedding_dim),
             nn.ReLU(),
             nn.Linear(args.embedding_dim, args.embedding_dim)
         )
 
+        # 1. 针对原始特征的投影
+        self.id_projection = nn.Linear(n_in, args.embedding_dim)
+        # 2. 针对残差类算子 (T1, T3, T4, T5) 的投影
+        self.res_projection = nn.Linear(n_in, args.embedding_dim)
+        # 3. 针对度数特征 (T2) 的专用编码器
+        self.deg_encoder = nn.Sequential(
+            nn.Linear(1, args.embedding_dim), # 输入是 1 维！
+            nn.GELU(),
+            nn.Linear(args.embedding_dim, args.embedding_dim)
+        )
+
+        # Token 位置编码
+        self.type_embedding = nn.Parameter(torch.zeros(1, self.token_length + 1, args.embedding_dim))
+        nn.init.xavier_uniform_(self.type_embedding)
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, args.embedding_dim))
+
+        self.self_attention_norm = nn.LayerNorm(args.embedding_dim)
+
         # 将模型移动到指定设备
         self.to(self.device)
     
-    def TransformerEncoder(self, tokens):
+    def TransformerEncoder(self, tokens, args):
         """
         Inputs:
             - tokens: 输入节点的 tokens 序列，形状 [batch_size, pp_k+1, feature_dim]
         Outputs:
             - emb: 输入节点的编码结果，形状 [1, batch_size, embedding_dim]
         """
+            # 分别投影（假设索引 0 是 ID，1,3,4,5 是残差，2 是度数）
+        t0 = self.id_projection(tokens[:, 0:1, :])      # [N, 1, D]
+        t1 = self.res_projection(tokens[:, 1:2, :])     # [N, 1, D]
+        t2 = self.deg_encoder(tokens[:, 2:3, 0:1].reshape(-1, 1)).unsqueeze(1)        # [N, 1, 1]
+        t3 = self.res_projection(tokens[:, 3:4, :])     # [N, 1, D]
+        t4 = self.res_projection(tokens[:, 4:5, :])     # [N, 1, D]
+        t5 = self.res_projection(tokens[:, 5:6, :])     # [N, 1, D]
 
-        emb = self.token_projection(tokens)
+        cls_tokens = self.cls_token.expand(tokens.shape[0], -1, -1)
+
+        
+        # 拼接并加上身份编码
+        emb = torch.cat([cls_tokens, t0, t1, t2, t3, t4, t5], dim=1)
+        # emb = self.self_attention_norm(emb)
+        emb = emb + self.type_embedding                 # Type embedding 在这里发挥“路标”作用
         for i, l in enumerate(self.layers):
             emb, current_attention_weights = self.layers[i](emb)
             if i == len(self.layers) - 1: # 拿到最后一层的注意力
@@ -248,15 +212,16 @@ class MatrixGAD(nn.Module):
 
         # 基于 attention_scores 进行池化，得到最终编码结果
         # emb: [1, N, embedding_dim]
-        emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
-
-        return emb
+        # emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
+        final_h = emb[:, 0, :]
+        # print("Entropy: ", get_attention_entropy(attention_weights))
+        return final_h.unsqueeze(0)
 
     def forward(self, input_tokens, adj, _, normal_for_train_idx, train_flag, args, sparse=False):
 
         # input_tokens: (N, args.pp_k+1, d)
         
-        emb = self.TransformerEncoder(input_tokens)
+        emb = self.TransformerEncoder(input_tokens, args)
 
         # 生成全局中心点
         h_mean = torch.mean(emb, dim=1, keepdim=True)
@@ -286,8 +251,8 @@ class MatrixGAD(nn.Module):
             # print(f"time for noise:{time.time() - start_time}")
 
             # 重构学习
-            reconstructed_tokens = self.token_decoder(emb).squeeze(0)  # [num_nodes, (args.pp_k+1)*n_in]
-            reconstruction_error = reconstructed_tokens - input_tokens.view(-1, (args.pp_k+1) * self.n_in)
+            reconstructed_tokens = self.token_decoder(emb).squeeze(0)  # [num_nodes, self.token_length * n_in]
+            reconstruction_error = reconstructed_tokens - input_tokens.view(-1, self.token_length * self.n_in)
             # Project reconstruction error to embedding dimension
             reconstruction_error_proj = self.reconstruction_proj(reconstruction_error[normal_for_generation_idx, :])
 
@@ -319,9 +284,9 @@ class MatrixGAD(nn.Module):
 
             loss_ring = torch.mean(ring_out_range_loss + ring_in_range_loss)
             # 将重构后的 tokens 再编码为 embedding
-            reconstructed_tokens_vector = torch.reshape(reconstructed_tokens, (-1, args.pp_k+1, self.n_in))
-            reencoded_emb = self.TransformerEncoder(reconstructed_tokens_vector)[:, normal_for_generation_idx, :].detach().squeeze(0)
-            loss_rec = self.compute_rec_loss(input_tokens, reconstructed_tokens, normal_for_generation_emb, reencoded_emb, normal_for_generation_idx)
+            reconstructed_tokens_vector = torch.reshape(reconstructed_tokens, (-1, self.token_length, self.n_in))
+            reencoded_emb = self.TransformerEncoder(reconstructed_tokens_vector, args)[:, normal_for_generation_idx, :].detach().squeeze(0)
+            loss_rec = self.weight_compute_rec_loss(input_tokens, reconstructed_tokens, normal_for_generation_emb, reencoded_emb, normal_for_generation_idx, args)
 
             emb_combine = torch.cat((emb[:, normal_for_train_idx, :], torch.unsqueeze(outlier_emb, 0)), 1)
 
@@ -348,9 +313,31 @@ class MatrixGAD(nn.Module):
         Returns:
             loss_rec: 重构损失值
         """
-        token_rec_loss = self.recon_loss_fn(reconstructed_tokens, input_tokens.view(-1, (self.args.pp_k+1) * self.n_in))
+        token_rec_loss = self.recon_loss_fn(reconstructed_tokens, input_tokens.view(-1, self.token_length * self.n_in))
         # 计算距离
         emb_rec_loss = torch.mean(torch.norm(normal_for_generation_emb.squeeze(0) - reencoded_emb, dim=-1))  # [N]
+        loss_rec = self.args.lambda_rec_tok * token_rec_loss + self.args.lambda_rec_emb * emb_rec_loss
+        return loss_rec
+    
+    def weight_compute_rec_loss(self, input_tokens, reconstructed_tokens, normal_for_generation_emb, reencoded_emb, normal_for_generation_idx, args):
+        # input_tokens 原形状: (N, 6, n_in)
+        # reconstructed_tokens 原形状: (N, 6 * n_in) -> 需 reshape
+        N = input_tokens.size(0)
+        recon_reshaped = reconstructed_tokens.view(N, 6, self.n_in)
+        
+        # 1. 计算每一位的 MSE
+        # t0_loss: 原始特征的重建损失 (最重要的锚点)
+        t0_loss = self.recon_loss_fn(recon_reshaped[:, 0, :], input_tokens[:, 0, :])
+        
+        # tr_loss: 其他算子 (T1~T5) 的重建损失
+        tr_loss = self.recon_loss_fn(recon_reshaped[:, 1:, :], input_tokens[:, 1:, :])
+        
+        # 2. 加权组合 (建议 gamma 设为 0.1 或更低)
+        token_rec_loss = t0_loss + args.rec_gamma * tr_loss
+        
+        # 3. 嵌入空间重构损失保持不变
+        emb_rec_loss = torch.mean(torch.norm(normal_for_generation_emb.squeeze(0) - reencoded_emb, dim=-1))
+        
         loss_rec = self.args.lambda_rec_tok * token_rec_loss + self.args.lambda_rec_emb * emb_rec_loss
         return loss_rec
 
