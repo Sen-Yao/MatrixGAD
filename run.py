@@ -117,6 +117,7 @@ def train(args):
         lr=args.peak_lr,
         end_lr=args.end_lr,
         power=1.0,
+        init_lr=args.init_lr,
     )
 
     # 损失函数设置
@@ -542,6 +543,7 @@ if __name__ == "__main__":
     parser.add_argument('--tot_updates', type=int, default=1000)
     parser.add_argument('--peak_lr', type=float, default=1e-4)    
     parser.add_argument('--end_lr', type=float, default=1e-4)
+    parser.add_argument('--init_lr', type=float, default=1e-6, help='Initial learning rate for warmup phase')
 
     parser.add_argument('--warmup_epoch', type=int, default=20)
 

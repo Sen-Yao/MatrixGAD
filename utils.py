@@ -671,18 +671,23 @@ def mixed_krylov_tokenization(features, adj, args):
 
 class PolynomialDecayLR(_LRScheduler):
 
-    def __init__(self, optimizer, warmup_updates, tot_updates, lr, end_lr, power, last_epoch=-1, verbose=False):
+    def __init__(self, optimizer, warmup_updates, tot_updates, lr, end_lr, power, init_lr=0.0, last_epoch=-1, verbose=False):
         self.warmup_updates = warmup_updates
         self.tot_updates = tot_updates
-        self.lr = lr
+        self.lr = lr  # peak_lr
         self.end_lr = end_lr
         self.power = power
+        self.init_lr = init_lr  # warmup起始学习率
         super(PolynomialDecayLR, self).__init__(optimizer, last_epoch, verbose)
 
     def get_lr(self):
         if self._step_count <= self.warmup_updates:
-            self.warmup_factor = self._step_count / float(self.warmup_updates)
-            lr = self.warmup_factor * self.lr
+            # Warmup阶段：从init_lr线性增加到peak_lr
+            if self.warmup_updates > 0:
+                warmup_factor = self._step_count / float(self.warmup_updates)
+                lr = self.init_lr + warmup_factor * (self.lr - self.init_lr)
+            else:
+                lr = self.lr
         elif self._step_count >= self.tot_updates:
             lr = self.end_lr
         else:
