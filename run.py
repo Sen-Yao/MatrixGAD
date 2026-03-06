@@ -110,13 +110,12 @@ def train(args):
             raise ValueError(f"Invalid model type: {args.model_type}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay)
-    lr_scheduler = PolynomialDecayLR(
+    lr_scheduler = CosineAnnealingWarmupLR(
         optimizer,
         warmup_updates=int(0.1 * args.num_epoch) if args.warmup_updates == -1 else args.warmup_updates,
         tot_updates=args.num_epoch,
-        lr=args.peak_lr,
+        peak_lr=args.peak_lr,
         end_lr=args.end_lr,
-        power=1.0,
         init_lr=args.init_lr,
     )
 

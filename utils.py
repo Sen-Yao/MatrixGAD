@@ -669,34 +669,53 @@ def mixed_krylov_tokenization(features, adj, args):
     return combined
 
 
-class PolynomialDecayLR(_LRScheduler):
-
-    def __init__(self, optimizer, warmup_updates, tot_updates, lr, end_lr, power, init_lr=0.0, last_epoch=-1, verbose=False):
+class CosineAnnealingWarmupLR(_LRScheduler):
+    """
+    余弦退火学习率调度器，带warmup功能
+    
+    学习率变化过程：
+    1. Warmup阶段：从init_lr线性增加到peak_lr
+    2. 余弦退火阶段：从peak_lr按余弦曲线平滑衰减到end_lr
+    
+    公式：lr = end_lr + (peak_lr - end_lr) * (1 + cos(π * progress)) / 2
+    其中 progress 从0到1，表示余弦退火阶段的进度
+    """
+    
+    def __init__(self, optimizer, warmup_updates, tot_updates, peak_lr, end_lr, init_lr=0.0, last_epoch=-1, verbose=False):
+        """
+        Args:
+            optimizer: 优化器
+            warmup_updates: warmup阶段的epoch数量
+            tot_updates: 总的训练epoch数量
+            peak_lr: 峰值学习率（warmup结束后的最大学习率）
+            end_lr: 最终衰减到的最小学习率
+            init_lr: warmup起始学习率
+        """
         self.warmup_updates = warmup_updates
         self.tot_updates = tot_updates
-        self.lr = lr  # peak_lr
+        self.peak_lr = peak_lr
         self.end_lr = end_lr
-        self.power = power
-        self.init_lr = init_lr  # warmup起始学习率
-        super(PolynomialDecayLR, self).__init__(optimizer, last_epoch, verbose)
+        self.init_lr = init_lr
+        super(CosineAnnealingWarmupLR, self).__init__(optimizer, last_epoch, verbose)
 
     def get_lr(self):
         if self._step_count <= self.warmup_updates:
             # Warmup阶段：从init_lr线性增加到peak_lr
             if self.warmup_updates > 0:
                 warmup_factor = self._step_count / float(self.warmup_updates)
-                lr = self.init_lr + warmup_factor * (self.lr - self.init_lr)
+                lr = self.init_lr + warmup_factor * (self.peak_lr - self.init_lr)
             else:
-                lr = self.lr
+                lr = self.peak_lr
         elif self._step_count >= self.tot_updates:
+            # 训练结束，使用最小学习率
             lr = self.end_lr
         else:
-            warmup = self.warmup_updates
-            lr_range = self.lr - self.end_lr
-            pct_remaining = 1 - (self._step_count - warmup) / (
-                self.tot_updates - warmup
-            )
-            lr = lr_range * pct_remaining ** (self.power) + self.end_lr
+            # 余弦退火阶段：从peak_lr平滑衰减到end_lr
+            # 计算当前在余弦退火阶段的进度 (0到1)
+            progress = (self._step_count - self.warmup_updates) / (self.tot_updates - self.warmup_updates)
+            # 余弦退火公式：lr = end_lr + (peak_lr - end_lr) * (1 + cos(π * progress)) / 2
+            cosine_factor = (1 + np.cos(np.pi * progress)) / 2
+            lr = self.end_lr + (self.peak_lr - self.end_lr) * cosine_factor
 
         return [lr for group in self.optimizer.param_groups]
 
