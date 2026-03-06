@@ -1,7 +1,5 @@
 import torch.nn as nn
 import numpy as np
-
-from model import Model
 from MatrixGAD import MatrixGAD
 from utils import *
 
@@ -108,9 +106,6 @@ def train(args):
             concated_input_features = multi_statistics_operator_tokenization(features.squeeze(0), adj.squeeze(0), args)
             print("check_token_collapse!:", check_token_collapse(concated_input_features))
             model = MatrixGAD(ft_size, args.embedding_dim, 'prelu', args)
-        elif args.model_type == 'GGAD':
-            concated_input_features = features.to(device)
-            model = Model(ft_size, args.embedding_dim, 'prelu', args.negsamp_ratio, args.readout, args)
         else:
             raise ValueError(f"Invalid model type: {args.model_type}")
 
