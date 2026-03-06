@@ -216,6 +216,11 @@ def train(args):
             # 获取当前学习率
             current_lr = optimizer.param_groups[0]['lr']
             
+            # 计算加权后的loss
+            weighted_bce_loss = dynamic_weights['bce_loss_weight'] * batched_bce_loss
+            weighted_rec_loss = dynamic_weights['rec_loss_weight'] * batched_rec_loss
+            weighted_uniformity_loss = dynamic_weights['uniformity_loss_weight'] * batched_uniformity_loss
+            
             # 更新进度条信息
             pbar.set_postfix({
                 'Time': f'{total_time:.1f}s',
@@ -229,6 +234,9 @@ def train(args):
                             "bce_loss": batched_bce_loss.item(),
                             "rec_loss": batched_rec_loss.item(),
                             "uniformity_loss": batched_uniformity_loss.item(),
+                            "weighted_bce_loss": weighted_bce_loss.item(),
+                            "weighted_rec_loss": weighted_rec_loss.item(),
+                            "weighted_uniformity_loss": weighted_uniformity_loss.item(),
                             "learning_rate": current_lr}, step=epoch)
         else:
             optimizer.zero_grad()
@@ -283,6 +291,14 @@ def train(args):
             # 获取当前学习率
             current_lr = optimizer.param_groups[0]['lr']
             
+            # 计算加权后的loss
+            weighted_margin_loss = dynamic_weights['margin_loss_weight'] * loss_margin
+            weighted_bce_loss = dynamic_weights['bce_loss_weight'] * loss_bce
+            weighted_rec_loss = dynamic_weights['rec_loss_weight'] * loss_rec
+            weighted_con_loss = dynamic_weights['con_loss_weight'] * con_loss
+            weighted_proj_loss = dynamic_weights['proj_loss_weight'] * proj_loss
+            weighted_reconstruction_loss = dynamic_weights['reconstruction_loss_weight'] * reconstruction_loss
+            
             # 更新进度条信息
             pbar.set_postfix({
                 'Time': f'{total_time:.1f}s',
@@ -299,6 +315,12 @@ def train(args):
                             "proj_loss": proj_loss.item(),
                             "train_loss": loss.item(),
                             "reconstruction_loss": reconstruction_loss.item(),
+                            "weighted_margin_loss": weighted_margin_loss.item(),
+                            "weighted_bce_loss": weighted_bce_loss.item(),
+                            "weighted_rec_loss": weighted_rec_loss.item(),
+                            "weighted_con_loss": weighted_con_loss.item(),
+                            "weighted_proj_loss": weighted_proj_loss.item(),
+                            "weighted_reconstruction_loss": weighted_reconstruction_loss.item(),
                             "learning_rate": current_lr}, step=epoch)
         lr_scheduler.step()
         if epoch % 10 == 0:
@@ -308,6 +330,10 @@ def train(args):
             if args.model_type == "MatrixGAD":
                 all_batched_logits = []
                 all_batched_embs = []  # 【新增】收集所有测试节点的 Embedding
+                eval_rec_loss = 0
+                eval_uniformity_loss = 0
+                eval_bce_loss = 0
+                num_eval_batches = 0
                 
                 with torch.no_grad():
                     for _, item in enumerate(test_data_loader):
@@ -319,6 +345,26 @@ def train(args):
                         
                         all_batched_logits.append(logits_out.squeeze(0))
                         all_batched_embs.append(emb.squeeze(0)) # 【新增】提取测试集的最终特征表达
+                        
+                        # 累积eval阶段的loss
+                        eval_rec_loss += loss_rec
+                        eval_uniformity_loss += loss_uniformity
+                        
+                        # 计算BCE loss (使用测试集标签)
+                        test_labels_binary = labels  # 测试集的真实标签
+                        eval_bce_val = b_xent(logits_out.squeeze(0), test_labels_binary.unsqueeze(1))
+                        eval_bce_loss += torch.mean(eval_bce_val)
+                        num_eval_batches += 1
+
+                    # 计算平均eval loss
+                    eval_rec_loss = eval_rec_loss / num_eval_batches
+                    eval_uniformity_loss = eval_uniformity_loss / num_eval_batches
+                    eval_bce_loss = eval_bce_loss / num_eval_batches
+                    
+                    # 计算加权后的eval loss
+                    weighted_eval_bce_loss = dynamic_weights['bce_loss_weight'] * eval_bce_loss
+                    weighted_eval_uniformity_loss = dynamic_weights['uniformity_loss_weight'] * eval_uniformity_loss
+                    weighted_eval_rec_loss = dynamic_weights['rec_loss_weight'] * eval_rec_loss
 
                     # 拼接所有批次结果
                     concatenated_logits = torch.cat(all_batched_logits, dim=0)
@@ -377,6 +423,7 @@ def train(args):
                     print(f"  AUC: {auc:.4f} | AP: {ap:.4f}")
                     print(f"  Logit_Margin: {logit_margin:.4f} | Logit_Std: {logit_std:.4f}")
                     print(f"  Emb_Cos_Sim: {avg_cos_sim:.4f} | Emb_Center_Dist: {center_dist:.4f}")
+                    print(f"  Weighted_Eval_BCE_Loss: {weighted_eval_bce_loss.item():.4f} | Weighted_Eval_Uniformity_Loss: {weighted_eval_uniformity_loss.item():.4f}")
             else: 
                 emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, _, con_loss, proj_loss, reconstruction_loss = model(concated_input_features, adj, normal_for_generation_idx, normal_for_train_idx,
                                                                         train_flag, args)
