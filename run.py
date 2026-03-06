@@ -340,8 +340,12 @@ def train(args):
                         concated_input_features = item[0].to(device)
                         labels = item[1].to(device)
                         # 注意解包数量与模型返回值对齐 (7个返回值)
+                        # eval 阶段：使用当前 batch 中的正常节点计算 uniformity_loss
+                        # 找到当前 batch 中标签为 0（正常）的节点索引
+                        batch_normal_idx = torch.nonzero(labels == 0, as_tuple=False).squeeze(-1)
+                        
                         emb, emb_combine, logits_out, outlier_emb, _, loss_rec, loss_uniformity = model(
-                            concated_input_features, None, None, None, train_flag, args)
+                            concated_input_features, None, None, batch_normal_idx, train_flag, args)
                         
                         all_batched_logits.append(logits_out.squeeze(0))
                         all_batched_embs.append(emb.squeeze(0)) # 【新增】提取测试集的最终特征表达

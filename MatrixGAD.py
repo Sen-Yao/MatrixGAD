@@ -148,18 +148,18 @@ class MatrixGAD(nn.Module):
         # --- 4. 移除不再需要的重构模块 ---
         # 删除了 token_decoder, reconstruction_proj 等
         self.to(self.device)
-    def compute_infoNCE_uniformity_loss(self, emb, normal_for_train_idx, args):
+    def compute_infoNCE_uniformity_loss(self, emb, normal_idx, args):
         """
         计算InfoNCE均匀性损失，推开不同正常节点在嵌入空间中的距离
         Args:
-            emb: [1, N, embedding_dim] - 所有节点的嵌入表征
-            normal_for_train_idx: 训练时使用的正常节点索引
+            emb: [1, N, embedding_dim] - 节点的嵌入表征
+            normal_idx: 正常节点索引（可以是全局索引或局部batch索引）
             args: 包含GNA_temp等超参数的配置
         Returns:
             uniformity_loss: InfoNCE均匀性损失
         """
         # 提取正常节点的嵌入: [num_normal, embedding_dim]
-        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, embedding_dim]
+        normal_emb = emb[0, normal_idx, :]  # [num_normal, embedding_dim]
         num_normal = normal_emb.size(0)
         
         # 如果正常节点数量少于2，无法计算InfoNCE损失
@@ -188,6 +188,42 @@ class MatrixGAD(nn.Module):
         # 对每一行计算logsumexp，得到每个节点与其他节点的相似度之和
         log_sum_exp_values = torch.logsumexp(similarity_matrix_masked, dim=1)  # [num_normal]
 
+        # 平均化损失
+        uniformity_loss = log_sum_exp_values.mean() - math.log(num_normal - 1)
+        
+        return uniformity_loss
+    
+    def compute_uniformity_loss_from_emb(self, normal_emb, args):
+        """
+        直接从正常节点嵌入计算InfoNCE均匀性损失（用于eval阶段）
+        Args:
+            normal_emb: [num_normal, embedding_dim] - 正常节点的嵌入
+            args: 包含GNA_temp等超参数的配置
+        Returns:
+            uniformity_loss: InfoNCE均匀性损失
+        """
+        num_normal = normal_emb.size(0)
+        
+        # 如果正常节点数量少于2，无法计算InfoNCE损失
+        if num_normal < 2:
+            return torch.tensor(0.0, device=normal_emb.device)
+        
+        # L2 归一化，便于计算余弦相似度
+        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)
+        
+        # 计算相似度矩阵
+        similarity_matrix = torch.mm(normal_emb_norm, normal_emb_norm.t())
+        
+        # 应用温度参数
+        similarity_matrix = similarity_matrix / args.GNA_temp
+        
+        # 创建掩码，排除对角线元素
+        mask = torch.eye(num_normal, device=normal_emb.device, dtype=torch.bool)
+        similarity_matrix_masked = similarity_matrix.masked_fill(mask, float('-inf'))
+        
+        # 计算logsumexp
+        log_sum_exp_values = torch.logsumexp(similarity_matrix_masked, dim=1)
+        
         # 平均化损失
         uniformity_loss = log_sum_exp_values.mean() - math.log(num_normal - 1)
         
@@ -263,6 +299,10 @@ class MatrixGAD(nn.Module):
             # 测试时不需要 labels 和 emb_combine
             labels = None
             emb_combine = emb.squeeze(0)
+            
+            # eval 模式下，如果提供了 normal_for_train_idx，也计算 uniformity_loss
+            if normal_for_train_idx is not None and len(normal_for_train_idx) > 1:
+                loss_uniformity = self.compute_infoNCE_uniformity_loss(emb, normal_for_train_idx, args)
         # 返回接口保持一致性
         # 注意：外部训练循环需自行计算 BCELoss(logits, labels)
         return emb, emb_combine, logits, outlier_emb, None, loss_rec, loss_uniformity
