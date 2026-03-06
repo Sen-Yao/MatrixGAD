@@ -136,7 +136,7 @@ class MatrixGAD(nn.Module):
             nn.Linear(args.embedding_dim, args.embedding_dim)
         )
         # --- 3. Transformer Encoder ---
-        self.token_length = 6
+        self.token_length = 4
         encoders = [EncoderLayer(args.embedding_dim, args.GT_ffn_dim, args.GT_dropout, args.GT_attention_dropout, args.GT_num_heads)
                     for _ in range(args.GT_num_layers)]
         self.layers = nn.ModuleList(encoders)
@@ -195,7 +195,7 @@ class MatrixGAD(nn.Module):
 
     def TransformerEncoder(self, tokens):
         """
-        输入: tokens [N, 6, D_in]
+        输入: tokens [N, 4, D_in]
         输出: emb [1, N, D_emb]
         """
         # 分别投影
@@ -205,12 +205,10 @@ class MatrixGAD(nn.Module):
         t2_input = tokens[:, 2:3, 0:1].reshape(-1, 1) # 取标量
         t2 = self.deg_encoder(t2_input).unsqueeze(1)
         t3 = self.res_projection(tokens[:, 3:4, :])
-        t4 = self.res_projection(tokens[:, 4:5, :])
-        t5 = self.res_projection(tokens[:, 5:6, :])
         cls_tokens = self.cls_token.expand(tokens.shape[0], -1, -1)
         
-        # 拼接 [CLS, T0, T1, T2, T3, T4, T5]
-        emb = torch.cat([cls_tokens, t0, t1, t2, t3, t4, t5], dim=1)
+        # 拼接 [CLS, T0, T1, T2, T3]
+        emb = torch.cat([cls_tokens, t0, t1, t2, t3], dim=1)
         emb = emb + self.type_embedding
         for layer in self.layers:
             emb, _ = layer(emb)
@@ -223,7 +221,7 @@ class MatrixGAD(nn.Module):
         核心逻辑修改：Idea 3 - Context-Ego Mismatching
         """
         # 1. 编码所有节点 (用于测试或无监督特征提取)
-        # input_tokens: [N, 6, D]
+        # input_tokens: [N, 4, D]
         emb = self.TransformerEncoder(input_tokens) # [1, N, D]
         # 初始化返回变量
         logits = None
