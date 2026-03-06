@@ -417,7 +417,7 @@ def train(args):
                     print(f"  Logit_Margin: {logit_margin:.4f} | Logit_Std: {logit_std:.4f}")
                     print(f"  Emb_Cos_Sim: {avg_cos_sim:.4f} | Emb_Center_Dist: {center_dist:.4f}")
                     print(f"  Weighted_Eval_BCE_Loss: {weighted_eval_bce_loss.item():.4f} | Weighted_Eval_Uniformity_Loss: {weighted_eval_uniformity_loss.item():.4f}")
-                    print(f"  Eval_Rec_Loss: {eval_rec_loss.item():.4f} | Weighted_Eval_Rec_Loss: {weighted_eval_rec_loss.item():.4f}")
+                    print(f"  Weighted_Eval_Rec_Loss: {weighted_eval_rec_loss.item():.4f}")
             else: 
                 emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, _, con_loss, proj_loss, reconstruction_loss = model(concated_input_features, adj, normal_for_generation_idx, normal_for_train_idx,
                                                                         train_flag, args)
