@@ -120,6 +120,9 @@ class MatrixGAD(nn.Module):
         self.fc2 = nn.Linear(int(n_h / 2), int(n_h / 4), bias=False)
         self.fc3 = nn.Linear(int(n_h / 4), 1, bias=False) # 输出 logits
         self.act = nn.ReLU()
+        # LayerNorm 用于控制 Logit 爆炸
+        self.ln1 = nn.LayerNorm(int(n_h / 2))
+        self.ln2 = nn.LayerNorm(int(n_h / 4))
         # --- 2. Tokenizer 定义 ---
         # T0: 属性特征专用
         self.id_projection = nn.Linear(n_in, args.embedding_dim)
@@ -144,6 +147,51 @@ class MatrixGAD(nn.Module):
         # --- 4. 移除不再需要的重构模块 ---
         # 删除了 token_decoder, reconstruction_proj 等
         self.to(self.device)
+    def compute_infoNCE_uniformity_loss(self, emb, normal_for_train_idx, args):
+        """
+        计算InfoNCE均匀性损失，推开不同正常节点在嵌入空间中的距离
+        Args:
+            emb: [1, N, embedding_dim] - 所有节点的嵌入表征
+            normal_for_train_idx: 训练时使用的正常节点索引
+            args: 包含GNA_temp等超参数的配置
+        Returns:
+            uniformity_loss: InfoNCE均匀性损失
+        """
+        # 提取正常节点的嵌入: [num_normal, embedding_dim]
+        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, embedding_dim]
+        num_normal = normal_emb.size(0)
+        
+        # 如果正常节点数量少于2，无法计算InfoNCE损失
+        if num_normal < 2:
+            return torch.tensor(0.0, device=emb.device)
+        
+        # L2 归一化，便于计算余弦相似度
+        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)  # [num_normal, embedding_dim]
+        
+        # 计算所有节点对之间的余弦相似度矩阵
+        # similarity_matrix[i,j] = cos_sim(node_i, node_j)
+        similarity_matrix = torch.mm(normal_emb_norm, normal_emb_norm.t())  # [num_normal, num_normal]
+        
+        # 应用温度参数
+        similarity_matrix = similarity_matrix / args.GNA_temp
+        
+        # 创建掩码，排除对角线元素（自己与自己的相似度）
+        mask = torch.eye(num_normal, device=emb.device, dtype=torch.bool)
+        
+        # 并行计算InfoNCE损失
+        # 对于每个锚点i，我们希望它与其他所有节点的相似度都尽可能小
+        # 使用掩码将对角线元素设为极小值，这样就不会影响logsumexp计算
+        similarity_matrix_masked = similarity_matrix.masked_fill(mask, float('-inf'))
+
+        # 并行计算所有节点的logsumexp值
+        # 对每一行计算logsumexp，得到每个节点与其他节点的相似度之和
+        log_sum_exp_values = torch.logsumexp(similarity_matrix_masked, dim=1)  # [num_normal]
+
+        # 平均化损失
+        uniformity_loss = log_sum_exp_values.mean()
+        
+        return uniformity_loss
+
     def TransformerEncoder(self, tokens):
         """
         输入: tokens [N, 6, D_in]
@@ -175,7 +223,7 @@ class MatrixGAD(nn.Module):
         """
         # 1. 编码所有节点 (用于测试或无监督特征提取)
         # input_tokens: [N, 6, D]
-        emb_all = self.TransformerEncoder(input_tokens) # [1, N, D]
+        emb = self.TransformerEncoder(input_tokens) # [1, N, D]
         # 初始化返回变量
         logits = None
         emb_combine = None
@@ -183,52 +231,39 @@ class MatrixGAD(nn.Module):
         # 占位符，保持接口兼容
         outlier_emb = None
         loss_rec = torch.tensor(0.0, device=self.device)
-        loss_ring = torch.tensor(0.0, device=self.device)
+        loss_uniformity = torch.tensor(0.0, device=self.device)
         if train_flag:
-            # 2. 提取正常节点的 Tokens
             normal_tokens = input_tokens[normal_for_train_idx]
             
-            # === 改进 A：随机移位距离，打破固定模式震荡 ===
-            # 将 shift 从固定的 1 改为随机值，增加"对抗性负例"的多样性
-            max_shift = max(1, normal_tokens.size(0) // 2)
-            shift = torch.randint(1, max_shift + 1, (1,)).item()
-            rolled_idx = torch.roll(torch.arange(normal_tokens.size(0)), shifts=shift)
-            
+            # 改进 A：保留单次错位，但让位移量是 Batch 级别的随机数 
+            # 意义：不增加架构复杂度的前提下，避免模型记住 shift=1 的固定相差距离
+            # 让每个节点的拓扑特征随机匹配给其他节点，打破批次内的一致性错位偏移
+            perm_idx = torch.randperm(normal_tokens.size(0), device=self.device)
+            # rolled_idx = torch.roll(torch.arange(normal_tokens.size(0)), shifts=shift).to(self.device)
             mismatched_tokens = normal_tokens.clone()
-            rolled_idx = rolled_idx.to(self.device)
-            mismatched_tokens[:, 1:, :] = normal_tokens[rolled_idx, 1:, :] # T1~T5拓扑特征错位
-            # 4. 编码
-            normal_emb = self.TransformerEncoder(normal_tokens).squeeze(0)
+            mismatched_tokens[:, 1:, :] = normal_tokens[perm_idx, 1:, :]
             outlier_emb = self.TransformerEncoder(mismatched_tokens).squeeze(0)
-            # === 改进 B：流形紧凑约束 (Manifold Compactness) ===
-            # 计算正常样本的局部质心，拉近它们之间的距离，稳住决策底盘
-            center = normal_emb.mean(dim=0, keepdim=True).detach() # detach防中心点过度漂移
-            loss_compactness = torch.mean(torch.norm(normal_emb - center, p=2, dim=1))
-            
-            # 复用 loss_ring 接口传递给外部
-            loss_ring = loss_compactness
+            normal_emb = emb[:, normal_for_train_idx, :].squeeze(0) # 直接复用已编码的特征省显存
+            # 改进 B：激活你写好的 InfoNCE 均匀性损失 (核心解药)
+            # 强制要求正常节点之间保持一定的夹角，拒绝 Cos_Sim 走向 1.0!
+            uniformity_loss = self.compute_infoNCE_uniformity_loss(emb, normal_for_train_idx, args)
+            # 将 uniformity_loss 传递给损失接口
+            loss_uniformity = uniformity_loss
             loss_rec = torch.tensor(0.0, device=self.device)
-            # 5. 构建训练数据
-            # 正常样本 label=0, 错配样本 label=1
-            emb_combine = torch.cat((normal_emb, outlier_emb), dim=0) # [2*N_normal, D]
+            emb_combine = torch.cat((normal_emb, outlier_emb), dim=0)
             
-            # 标签构建
-            labels = torch.cat((
-                torch.zeros(normal_emb.size(0), device=self.device),
-                torch.ones(outlier_emb.size(0), device=self.device)
-            ), dim=0).unsqueeze(1) # [2*N_normal, 1]
-            # 6. 分类器前向传播
-            f_1 = self.act(self.fc1(emb_combine))
-            f_2 = self.act(self.fc2(f_1))
-            logits = self.fc3(f_2) # [2*N_normal, 1]
+            # 保留 LayerNorm (控制 Logit 爆炸)
+            f_1 = self.act(self.ln1(self.fc1(emb_combine)))
+            f_2 = self.act(self.ln2(self.fc2(f_1)))
+            logits = self.fc3(f_2)
         else:
             # 测试模式：对所有节点进行预测
-            f_1 = self.act(self.fc1(emb_all.squeeze(0)))
+            f_1 = self.act(self.fc1(emb.squeeze(0)))
             f_2 = self.act(self.fc2(f_1))
             logits = self.fc3(f_2) # [N, 1]
             # 测试时不需要 labels 和 emb_combine
             labels = None
-            emb_combine = emb_all.squeeze(0)
+            emb_combine = emb.squeeze(0)
         # 返回接口保持一致性
         # 注意：外部训练循环需自行计算 BCELoss(logits, labels)
-        return emb_all, emb_combine, logits, outlier_emb, None, loss_rec, loss_ring
+        return emb, emb_combine, logits, outlier_emb, None, loss_rec, loss_uniformity

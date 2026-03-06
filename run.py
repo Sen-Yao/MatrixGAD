@@ -193,7 +193,7 @@ def train(args):
         if args.model_type == "MatrixGAD":
             batched_bce_loss = 0
             batched_rec_loss = 0
-            batched_ring_loss = 0
+            batched_uniformity_loss = 0
             # start_time = time.time()
             for batch_idx, item in enumerate(train_data_loader):
                 # print(f"time to start batch {time.time() - start_time}")
@@ -204,7 +204,7 @@ def train(args):
                 optimizer.zero_grad()
                 is_known_normal_mask = torch.isin(batch_global_indices, normal_for_train_idx)
                 local_normal_for_train_idx = torch.nonzero(is_known_normal_mask, as_tuple=False).squeeze(-1)
-                emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring = model(concated_input_features, None,
+                emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_uniformity = model(concated_input_features, None,
                                                                     None, local_normal_for_train_idx,
                                                                     train_flag, args)
                     # BCE loss
@@ -218,15 +218,15 @@ def train(args):
                 # diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
                 # loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
 
-                loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring
+                loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['uniformity_loss_weight'] * loss_uniformity
 
                 loss.backward()
                 optimizer.step()
                 batched_bce_loss += loss_bce
                 batched_rec_loss += loss_rec
-                batched_ring_loss += loss_ring
+                batched_uniformity_loss += loss_uniformity
 
-            batched_total_loss = batched_bce_loss + batched_rec_loss + batched_ring_loss
+            batched_total_loss = batched_bce_loss + batched_rec_loss + batched_uniformity_loss
             end_time = time.time()
             total_time += end_time - start_time
             
@@ -245,7 +245,7 @@ def train(args):
                 wandb.log({ "batched_total_loss": batched_total_loss.item(),
                             "bce_loss": batched_bce_loss.item(),
                             "rec_loss": batched_rec_loss.item(),
-                            "ring_loss": batched_ring_loss.item(),
+                            "uniformity_loss": batched_uniformity_loss.item(),
                             "learning_rate": current_lr}, step=epoch)
         else:
             optimizer.zero_grad()
@@ -331,7 +331,7 @@ def train(args):
                         concated_input_features = item[0].to(device)
                         labels = item[1].to(device)
                         # 注意解包数量与模型返回值对齐 (7个返回值)
-                        emb, emb_combine, logits_out, outlier_emb, _, loss_rec, loss_ring = model(
+                        emb, emb_combine, logits_out, outlier_emb, _, loss_rec, loss_uniformity = model(
                             concated_input_features, None, None, None, train_flag, args)
                         
                         all_batched_logits.append(logits_out.squeeze(0))
@@ -504,7 +504,7 @@ if __name__ == "__main__":
     parser.add_argument('--con_loss_weight', type=float, default=0.1)
     parser.add_argument('--proj_loss_weight', type=float, default=0)
     parser.add_argument('--reconstruction_loss_weight', type=float, default=1.0)
-    parser.add_argument('--ring_loss_weight', type=float, default=1.0)
+    parser.add_argument('--uniformity_loss_weight', type=float, default=1.0)
 
     parser.add_argument('--rec_gamma', type=float, default=0.1)
     parser.add_argument('--lambda_rec_tok', type=float, default=1.0)
