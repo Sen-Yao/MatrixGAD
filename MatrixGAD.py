@@ -128,7 +128,7 @@ class MatrixGAD(nn.Module):
         # --- 2. Tokenizer 定义 ---
         # T0: 属性特征专用
         self.id_projection = nn.Linear(n_in, args.embedding_dim)
-        # T1, T3, T4, T5: 残差/拓扑特征
+        # T1, T3: 残差/拓扑特征
         self.res_projection = nn.Linear(n_in, args.embedding_dim)
         # T2: 度数特征 (假设输入是标量)
         self.deg_encoder = nn.Sequential(

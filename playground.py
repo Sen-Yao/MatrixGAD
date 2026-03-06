@@ -275,20 +275,10 @@ def multi_statistics_operator_tokenization(features, adj, args):
     # (X - A1X) - (A1X - A2X) -> 捕捉结构突变
     a2_mean = node_neighborhood_feature(adj, features, 2, 0)
     t3 = (t0 - a_mean) - (a_mean - a2_mean)
-    # T4: 局部对比增强 (Local Sharpness/Max-Contrast)
-    # 在金融欺诈中，异常点往往在某些特定属性上远超邻居。
-    # 这里我们模拟一个简单的“极值偏差”，或者使用 A^4 这种跨度较大的残差
-    a4_mean = node_neighborhood_feature(adj, features, 4, 0)
-    t4 = t0 - a4_mean
-    # T5: 全局上下文锚点 (Global Anchor)
-    # 捕捉节点相对于全图（正常群体）的绝对位置偏离
-    global_center = features.mean(dim=0, keepdim=True)
-    t5 = t0 - global_center
-    # 最终组合：只保留这 6 个物理意义截然不同的 Token
-    tokens = torch.stack([t0, t1, t2, t3, t4, t5], dim=1)
     
-    # 这里的 tokens 形状为 (N, 6, D)
-    diagnostic_tokens(tokens)
+    # 最终组合：只保留这 4 个物理意义截然不同的 Token
+    tokens = torch.stack([t0, t1, t2, t3], dim=1)
+    
     return tokens
 
 
