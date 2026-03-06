@@ -230,11 +230,7 @@ def train(args):
             })
             pbar.update(1)
             if epoch % 2 == 0:
-                wandb.log({ "batched_total_loss": batched_total_loss.item(),
-                            "bce_loss": batched_bce_loss.item(),
-                            "rec_loss": batched_rec_loss.item(),
-                            "uniformity_loss": batched_uniformity_loss.item(),
-                            "weighted_bce_loss": weighted_bce_loss.item(),
+                wandb.log({ "weighted_bce_loss": weighted_bce_loss.item(),
                             "weighted_rec_loss": weighted_rec_loss.item(),
                             "weighted_uniformity_loss": weighted_uniformity_loss.item(),
                             "learning_rate": current_lr}, step=epoch)
@@ -308,14 +304,7 @@ def train(args):
             })
             pbar.update(1)
             if epoch % 2 == 0:
-                wandb.log({ "margin_loss": loss_margin.item(),
-                            "bce_loss": loss_bce.item(),
-                            "rec_loss": loss_rec.item(),
-                            "con_loss": con_loss.item(),
-                            "proj_loss": proj_loss.item(),
-                            "train_loss": loss.item(),
-                            "reconstruction_loss": reconstruction_loss.item(),
-                            "weighted_margin_loss": weighted_margin_loss.item(),
+                wandb.log({ "weighted_margin_loss": weighted_margin_loss.item(),
                             "weighted_bce_loss": weighted_bce_loss.item(),
                             "weighted_rec_loss": weighted_rec_loss.item(),
                             "weighted_con_loss": weighted_con_loss.item(),
