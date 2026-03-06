@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import random
 import time
+import math
 
 from check_gpu_memory import print_gpu_memory_usage, print_tensor_memory, clear_gpu_memory
 
@@ -188,7 +189,7 @@ class MatrixGAD(nn.Module):
         log_sum_exp_values = torch.logsumexp(similarity_matrix_masked, dim=1)  # [num_normal]
 
         # 平均化损失
-        uniformity_loss = log_sum_exp_values.mean()
+        uniformity_loss = log_sum_exp_values.mean() - math.log(num_normal - 1)
         
         return uniformity_loss
 
