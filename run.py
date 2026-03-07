@@ -179,6 +179,7 @@ def train(args):
             batched_rec_loss = 0
             batched_uniformity_loss = 0
             last_outlier_emb = None  # 保存最后一个batch的伪异常embedding用于诊断
+            last_outlier_logits = None  # 保存最后一个batch的伪异常logits用于诊断
             # start_time = time.time()
             for batch_idx, item in enumerate(train_data_loader):
                 # print(f"time to start batch {time.time() - start_time}")
@@ -211,9 +212,12 @@ def train(args):
                 batched_rec_loss += loss_rec
                 batched_uniformity_loss += loss_uniformity
                 
-                # 保存最后一个batch的伪异常embedding用于诊断
+                # 保存最后一个batch的伪异常embedding和logits用于诊断
                 if outlier_emb is not None:
                     last_outlier_emb = outlier_emb.detach()
+                    # logits 的后半部分是伪异常节点的 logits
+                    num_outliers = outlier_emb.size(0)
+                    last_outlier_logits = logits[-num_outliers:].detach()
 
             batched_total_loss = batched_bce_loss + batched_rec_loss + batched_uniformity_loss
             end_time = time.time()
@@ -358,6 +362,7 @@ def train(args):
                         labels=ano_label,
                         test_indices=np.array(idx_test),
                         outlier_emb=last_outlier_emb,  # 传递训练阶段的伪异常embedding
+                        outlier_logits=last_outlier_logits,  # 传递训练阶段的伪异常logits
                         bce_loss=avg_train_bce_loss.item(),
                         uniformity_loss=avg_train_uniformity_loss.item(),
                         rec_loss=avg_train_rec_loss.item(),

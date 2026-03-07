@@ -17,19 +17,24 @@ from typing import Optional, Dict, Any, Tuple, List
 @dataclass
 class DiagnosticMetrics:
     """诊断指标数据类"""
-    # 基础指标
+    # 基础指标（无默认值，必须放在前面）
     auc: float
     ap: float
     
-    # Logit分析指标
+    # Logit分析指标（无默认值）
     logit_margin: float  # 异常与正常节点的logit均值差
     logit_std: float     # logit的标准差
     
-    # Embedding分析指标
+    # Embedding分析指标（无默认值）
     emb_cos_sim: float      # 正常节点embedding的平均余弦相似度（检测塌缩）
     emb_center_dist: float   # 正常与异常节点中心的欧氏距离
     
-    # 特征中心距离指标（新增）
+    # 分类器平均Logit值（有默认值，放在后面）
+    logit_N_real: Optional[float] = None    # 真正常节点的平均logit
+    logit_A_pseudo: Optional[float] = None   # 伪异常节点的平均logit
+    logit_A_real: Optional[float] = None     # 真异常节点的平均logit
+    
+    # 特征中心距离指标（有默认值）
     dist_Nreal_Areal: Optional[float] = None    # 真正常与真异常的特征中心距离
     dist_Nreal_Apseudo: Optional[float] = None  # 真正常与伪异常的特征中心距离
     dist_Areal_Apseudo: Optional[float] = None  # 真异常与伪异常的特征中心距离
@@ -53,18 +58,23 @@ class DiagnosticCalculator:
     def compute_logits_analysis(
         self, 
         logits: torch.Tensor, 
-        labels: np.ndarray
-    ) -> Tuple[float, float]:
+        labels: np.ndarray,
+        outlier_logits: Optional[torch.Tensor] = None
+    ) -> Tuple[float, float, Optional[float], Optional[float], Optional[float]]:
         """
         计算Logit分析指标
         
         Args:
-            logits: 模型输出的logits张量 [N]
+            logits: 模型输出的logits张量 [N]（测试集节点的logits）
             labels: 真实标签数组 [N], 0表示正常, 1表示异常
+            outlier_logits: 伪异常节点的logits张量 [M]（可选）
             
         Returns:
             logit_margin: 异常与正常节点的logit均值差
             logit_std: logit的标准差
+            logit_N_real: 真正常节点的平均logit
+            logit_A_pseudo: 伪异常节点的平均logit
+            logit_A_real: 真异常节点的平均logit
         """
         # 确保logits在CPU上
         logits_cpu = logits.cpu().squeeze()
@@ -73,14 +83,24 @@ class DiagnosticCalculator:
         norm_mask = (labels == 0)
         abnorm_mask = (labels == 1)
         
-        norm_logits = logits_cpu[norm_mask]
-        abnorm_logits = logits_cpu[abnorm_mask]
+        norm_logits = logits_cpu[norm_mask]  # N_real 的 logits
+        abnorm_logits = logits_cpu[abnorm_mask]  # A_real 的 logits
         
         # 计算指标
         logit_margin = (abnorm_logits.mean() - norm_logits.mean()).item()
         logit_std = logits_cpu.std().item()
         
-        return logit_margin, logit_std
+        # 计算三类节点的平均 Logit 值
+        logit_N_real = norm_logits.mean().item() if len(norm_logits) > 0 else None
+        logit_A_real = abnorm_logits.mean().item() if len(abnorm_logits) > 0 else None
+        
+        # 计算伪异常节点的平均 Logit 值
+        logit_A_pseudo = None
+        if outlier_logits is not None and outlier_logits.numel() > 0:
+            outlier_logits_cpu = outlier_logits.cpu().squeeze()
+            logit_A_pseudo = outlier_logits_cpu.mean().item()
+        
+        return logit_margin, logit_std, logit_N_real, logit_A_pseudo, logit_A_real
     
     def compute_embedding_analysis(
         self, 
@@ -185,6 +205,7 @@ class DiagnosticCalculator:
         labels: np.ndarray,
         test_indices: np.ndarray,
         outlier_emb: Optional[torch.Tensor] = None,
+        outlier_logits: Optional[torch.Tensor] = None,
         bce_loss: Optional[float] = None,
         uniformity_loss: Optional[float] = None,
         rec_loss: Optional[float] = None,
@@ -194,13 +215,15 @@ class DiagnosticCalculator:
         计算所有诊断指标
         
         Args:
-            logits: 模型输出的logits张量 [N]
+            logits: 模型输出的logits张量 [N]（测试集节点的logits）
             embeddings: 节点embedding张量 [N, D]
             labels: 完整的标签数组（用于获取测试集标签）
             test_indices: 测试集索引
-            eval_bce_loss: 评估阶段的BCE loss
-            eval_uniformity_loss: 评估阶段的uniformity loss
-            eval_rec_loss: 评估阶段的重建loss
+            outlier_emb: 伪异常节点的embedding张量 [M, D]（可选）
+            outlier_logits: 伪异常节点的logits张量 [M]（可选）
+            bce_loss: 评估阶段的BCE loss
+            uniformity_loss: 评估阶段的uniformity loss
+            rec_loss: 评估阶段的重建loss
             loss_weights: 损失权重字典，用于计算加权loss
             
         Returns:
@@ -214,8 +237,10 @@ class DiagnosticCalculator:
         auc = roc_auc_score(test_labels, logits_np)
         ap = average_precision_score(test_labels, logits_np, average='macro', pos_label=1)
         
-        # 计算Logit分析指标
-        logit_margin, logit_std = self.compute_logits_analysis(logits, test_labels)
+        # 计算Logit分析指标（包括三类节点的平均Logit值）
+        logit_margin, logit_std, logit_N_real, logit_A_pseudo, logit_A_real = self.compute_logits_analysis(
+            logits, test_labels, outlier_logits
+        )
         
         # 计算Embedding分析指标
         emb_cos_sim, emb_center_dist = self.compute_embedding_analysis(embeddings, test_labels)
@@ -240,6 +265,9 @@ class DiagnosticCalculator:
             ap=ap,
             logit_margin=logit_margin,
             logit_std=logit_std,
+            logit_N_real=logit_N_real,
+            logit_A_pseudo=logit_A_pseudo,
+            logit_A_real=logit_A_real,
             emb_cos_sim=emb_cos_sim,
             emb_center_dist=emb_center_dist,
             dist_Nreal_Areal=dist_Nreal_Areal,
@@ -287,6 +315,14 @@ def log_diagnostics(
     if metrics.dist_Areal_Apseudo is not None:
         log_dict["Diag/Dist_Areal_Apseudo"] = metrics.dist_Areal_Apseudo
     
+    # 添加分类器平均Logit值指标（如果有）
+    if metrics.logit_N_real is not None:
+        log_dict["Diag/Logit_N_real"] = metrics.logit_N_real
+    if metrics.logit_A_pseudo is not None:
+        log_dict["Diag/Logit_A_pseudo"] = metrics.logit_A_pseudo
+    if metrics.logit_A_real is not None:
+        log_dict["Diag/Logit_A_real"] = metrics.logit_A_real
+    
     # 添加loss指标（如果有）
     if metrics.weighted_bce_loss is not None:
         log_dict["Diag/Weighted_BCE_Loss"] = metrics.weighted_bce_loss
@@ -299,6 +335,18 @@ def log_diagnostics(
     print(f"\n[Epoch {epoch}] Diagnostic Metrics:")
     print(f"  AUC: {metrics.auc:.4f} | AP: {metrics.ap:.4f} | LR: {current_lr:.6f}")
     print(f"  Logit_Margin: {metrics.logit_margin:.4f} | Logit_Std: {metrics.logit_std:.4f}")
+    
+    # 打印分类器平均Logit值
+    if metrics.logit_N_real is not None or metrics.logit_A_pseudo is not None or metrics.logit_A_real is not None:
+        logit_parts = []
+        if metrics.logit_N_real is not None:
+            logit_parts.append(f"N_real: {metrics.logit_N_real:.4f}")
+        if metrics.logit_A_pseudo is not None:
+            logit_parts.append(f"A_pseudo: {metrics.logit_A_pseudo:.4f}")
+        if metrics.logit_A_real is not None:
+            logit_parts.append(f"A_real: {metrics.logit_A_real:.4f}")
+        print(f"  Avg Logit | {' | '.join(logit_parts)}")
+    
     print(f"  Emb_Cos_Sim: {metrics.emb_cos_sim:.4f} | Emb_Center_Dist: {metrics.emb_center_dist:.4f}")
     
     # 打印特征中心距离指标
