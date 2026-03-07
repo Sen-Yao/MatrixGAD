@@ -413,7 +413,7 @@ def train(args):
                     
                     # 打印诊断结果供 debug
                     print(f"\n[Epoch {epoch}] Diagnostic Metrics:")
-                    print(f"  AUC: {auc:.4f} | AP: {ap:.4f}")
+                    print(f"  AUC: {auc:.4f} | AP: {ap:.4f} | LR: {current_lr:.6f}")
                     print(f"  Logit_Margin: {logit_margin:.4f} | Logit_Std: {logit_std:.4f}")
                     print(f"  Emb_Cos_Sim: {avg_cos_sim:.4f} | Emb_Center_Dist: {center_dist:.4f}")
                     print(f"  Weighted_Eval_BCE_Loss: {weighted_eval_bce_loss.item():.4f} | Weighted_Eval_Uniformity_Loss: {weighted_eval_uniformity_loss.item():.4f}")
