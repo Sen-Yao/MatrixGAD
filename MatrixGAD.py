@@ -334,7 +334,7 @@ class MatrixGAD(nn.Module):
         if train_flag:
             normal_tokens = input_tokens[normal_for_train_idx]
             
-            # ========== 重构学习 (参考 GGADFormer 设计) ==========
+            # ========== 重构学习 (仅用于计算重构损失，不用于生成伪异常) ==========
             # 1. 解码: 将 embedding 解码回 token 空间
             reconstructed_tokens = self.token_decoder(emb.squeeze(0))  # [N, 3*n_in + 1]
             
@@ -352,20 +352,15 @@ class MatrixGAD(nn.Module):
             # 3. 将重构误差投影到 embedding 维度
             reconstruction_error_proj = self.reconstruction_proj(reconstruction_error)  # [N, embedding_dim]
             
-            # 4. 采样正常节点用于生成 outlier
-            sample_rate = getattr(args, 'sample_rate', 0.5)
+            # 4. 计算重构损失（采样部分节点）
+            sample_rate = getattr(args, 'sample_rate', 0.15)
             num_samples = max(1, int(len(normal_for_train_idx) * sample_rate))
             sample_indices = torch.randperm(len(normal_for_train_idx), device=self.device)[:num_samples]
             normal_for_generation_idx = normal_for_train_idx[sample_indices]
             
             normal_for_generation_emb = emb[:, normal_for_generation_idx, :]  # [1, num_samples, D]
             
-            # 5. 使用重构误差生成 outlier embedding
-            outlier_beta = getattr(args, 'outlier_beta', 1.0)
-            outlier_emb = normal_for_generation_emb.squeeze(0) + outlier_beta * reconstruction_error_proj[normal_for_generation_idx]
-            
-            # 6. 将重构后的 tokens 重新编码为 embedding (用于 embedding 空间重构损失)
-            # 需要将 reconstructed_tokens 转换回 [N, 4, D] 格式
+            # 将重构后的 tokens 重新编码为 embedding (用于 embedding 空间重构损失)
             N = reconstructed_tokens.size(0)
             
             rec_t0 = reconstructed_tokens[:, :self.n_in].unsqueeze(1)  # [N, 1, n_in]
@@ -383,22 +378,20 @@ class MatrixGAD(nn.Module):
             # 重新编码 (detach 以避免影响梯度)
             reencoded_emb = self.TransformerEncoder(reconstructed_tokens_vector)[:, normal_for_generation_idx, :].detach().squeeze(0)
             
-            # 7. 计算重构损失
+            # 计算重构损失
             loss_rec = self.compute_rec_loss(
                 input_tokens, reconstructed_tokens, 
                 normal_for_generation_emb, reencoded_emb, 
                 normal_for_generation_idx
             )
             
-            # ========== Context-Ego Mismatching (保留原有逻辑) ==========
+            # ========== Context-Ego Mismatching (唯一的伪异常生成策略) ==========
             perm_idx = torch.randperm(normal_tokens.size(0), device=self.device)
             mismatched_tokens = normal_tokens.clone()
             mismatched_tokens[:, 1:, :] = normal_tokens[perm_idx, 1:, :]
-            mismatched_outlier_emb = self.TransformerEncoder(mismatched_tokens).squeeze(0)
+            outlier_emb = self.TransformerEncoder(mismatched_tokens).squeeze(0)
             
-            # 合并两种 outlier embedding
             normal_emb = emb[:, normal_for_train_idx, :].squeeze(0)
-            outlier_emb = torch.cat([outlier_emb, mismatched_outlier_emb], dim=0)  # 直接覆盖 outlier_emb
             
             # InfoNCE 均匀性损失
             uniformity_loss = self.compute_infoNCE_uniformity_loss(emb, normal_for_train_idx, args)
