@@ -15,6 +15,7 @@ import torch.utils.data as Data
 import wandb
 from visualization import create_tsne_visualization, visualize_attention_weights
 from utils import send_notification
+from diagnostics import DiagnosticCalculator, log_diagnostics
 
 from playground import *
 
@@ -216,10 +217,16 @@ def train(args):
             # 获取当前学习率
             current_lr = optimizer.param_groups[0]['lr']
             
+            # 计算平均训练loss（用于诊断信息）
+            num_train_batches = len(train_data_loader)
+            avg_train_bce_loss = batched_bce_loss / num_train_batches
+            avg_train_rec_loss = batched_rec_loss / num_train_batches
+            avg_train_uniformity_loss = batched_uniformity_loss / num_train_batches
+            
             # 计算加权后的loss
-            weighted_bce_loss = dynamic_weights['bce_loss_weight'] * batched_bce_loss
-            weighted_rec_loss = dynamic_weights['rec_loss_weight'] * batched_rec_loss
-            weighted_uniformity_loss = dynamic_weights['uniformity_loss_weight'] * batched_uniformity_loss
+            weighted_bce_loss = dynamic_weights['bce_loss_weight'] * avg_train_bce_loss
+            weighted_rec_loss = dynamic_weights['rec_loss_weight'] * avg_train_rec_loss
+            weighted_uniformity_loss = dynamic_weights['uniformity_loss_weight'] * avg_train_uniformity_loss
             
             # 更新进度条信息
             pbar.set_postfix({
@@ -318,106 +325,44 @@ def train(args):
 
             if args.model_type == "MatrixGAD":
                 all_batched_logits = []
-                all_batched_embs = []  # 【新增】收集所有测试节点的 Embedding
-                eval_rec_loss = 0
-                eval_uniformity_loss = 0
-                eval_bce_loss = 0
-                num_eval_batches = 0
+                all_batched_embs = []  # 收集所有测试节点的 Embedding
                 
                 with torch.no_grad():
                     for _, item in enumerate(test_data_loader):
                         concated_input_features = item[0].to(device)
                         labels = item[1].to(device)
-                        # 注意解包数量与模型返回值对齐 (7个返回值)
-                        # eval 阶段：使用当前 batch 中的正常节点计算 uniformity_loss
+                        
                         # 找到当前 batch 中标签为 0（正常）的节点索引
                         batch_normal_idx = torch.nonzero(labels == 0, as_tuple=False).squeeze(-1)
                         
-                        emb, emb_combine, logits_out, outlier_emb, _, loss_rec, loss_uniformity = model(
+                        emb, emb_combine, logits_out, outlier_emb, _, _, _ = model(
                             concated_input_features, None, None, batch_normal_idx, train_flag, args)
                         
                         all_batched_logits.append(logits_out.squeeze(0))
-                        all_batched_embs.append(emb.squeeze(0)) # 【新增】提取测试集的最终特征表达
-                        
-                        # 累积eval阶段的loss
-                        eval_rec_loss += loss_rec
-                        eval_uniformity_loss += loss_uniformity
-                        
-                        # 计算BCE loss (使用测试集标签)
-                        test_labels_binary = labels  # 测试集的真实标签
-                        eval_bce_val = b_xent(logits_out.squeeze(0), test_labels_binary.unsqueeze(1))
-                        eval_bce_loss += torch.mean(eval_bce_val)
-                        num_eval_batches += 1
-
-                    # 计算平均eval loss
-                    eval_rec_loss = eval_rec_loss / num_eval_batches
-                    eval_uniformity_loss = eval_uniformity_loss / num_eval_batches
-                    eval_bce_loss = eval_bce_loss / num_eval_batches
-                    
-                    # 计算加权后的eval loss
-                    weighted_eval_bce_loss = dynamic_weights['bce_loss_weight'] * eval_bce_loss
-                    weighted_eval_uniformity_loss = dynamic_weights['uniformity_loss_weight'] * eval_uniformity_loss
-                    weighted_eval_rec_loss = dynamic_weights['rec_loss_weight'] * eval_rec_loss
+                        all_batched_embs.append(emb.squeeze(0))
 
                     # 拼接所有批次结果
                     concatenated_logits = torch.cat(all_batched_logits, dim=0)
                     concatenated_embs = torch.cat(all_batched_embs, dim=0)
                     
-                    logits_np = np.squeeze(concatenated_logits.cpu().detach().numpy())
-                    auc = roc_auc_score(ano_label[idx_test], logits_np)
-                    ap = average_precision_score(ano_label[idx_test], logits_np, average='macro', pos_label=1)
+                    # 使用诊断模块计算所有诊断指标（使用训练阶段的loss）
+                    diagnostic_calculator = DiagnosticCalculator(device)
+                    metrics = diagnostic_calculator.compute_all_metrics(
+                        logits=concatenated_logits,
+                        embeddings=concatenated_embs,
+                        labels=ano_label,
+                        test_indices=np.array(idx_test),
+                        bce_loss=avg_train_bce_loss.item(),
+                        uniformity_loss=avg_train_uniformity_loss.item(),
+                        rec_loss=avg_train_rec_loss.item(),
+                        loss_weights=dynamic_weights
+                    )
                     
-                    # ==========================================
-                    # 【核心】诊断指标计算块 (Diagnostic Probes)
-                    # ==========================================
-                    # 划分测试集中的 "真实正常" vs "真实异常"
-                    test_labels = ano_label[idx_test]
-                    norm_mask = (test_labels == 0)
-                    abnorm_mask = (test_labels == 1)
+                    auc = metrics.auc
+                    ap = metrics.ap
                     
-                    logits_tensor = concatenated_logits.cpu().squeeze()
-                    embs_tensor = concatenated_embs.cpu()
-                    
-                    # 取出对应的 Logits 和 Embeddings
-                    norm_logits = logits_tensor[norm_mask]
-                    abnorm_logits = logits_tensor[abnorm_mask]
-                    norm_embs = embs_tensor[norm_mask]
-                    abnorm_embs = embs_tensor[abnorm_mask]
-
-                    # 探针 1：预测置信度与翻转诊断 (Logit Analysis)
-                    logit_margin = (abnorm_logits.mean() - norm_logits.mean()).item()
-                    logit_std = logits_tensor.std().item()
-
-                    # 探针 2：表征塌缩监控 (Embedding Collapse)
-                    # 采样最多1000个节点计算两两余弦相似度（防OOM）
-                    num_samples = min(norm_embs.size(0), 1000)
-                    sampled_norm_embs = torch.nn.functional.normalize(norm_embs[:num_samples], p=2, dim=1)
-                    cos_sim_matrix = torch.mm(sampled_norm_embs, sampled_norm_embs.t())
-                    mask = torch.eye(num_samples, dtype=torch.bool).flatten()
-                    avg_cos_sim = cos_sim_matrix.flatten()[~mask].mean().item()
-
-                    # 探针 3：真实流形分离度 (Euclidean Separation)
-                    norm_center = norm_embs.mean(dim=0)
-                    abnorm_center = abnorm_embs.mean(dim=0)
-                    center_dist = torch.norm(norm_center - abnorm_center, p=2).item()
-
-                    # 将诊断指标推送到 WandB
-                    wandb.log({
-                        "AUC": auc, 
-                        "AP": ap,
-                        "Diag/Logit_Margin": logit_margin,
-                        "Diag/Logit_Std": logit_std,
-                        "Diag/Emb_Cos_Sim": avg_cos_sim,
-                        "Diag/Emb_Center_Dist": center_dist
-                    }, step=epoch)
-                    
-                    # 打印诊断结果供 debug
-                    print(f"\n[Epoch {epoch}] Diagnostic Metrics:")
-                    print(f"  AUC: {auc:.4f} | AP: {ap:.4f} | LR: {current_lr:.6f}")
-                    print(f"  Logit_Margin: {logit_margin:.4f} | Logit_Std: {logit_std:.4f}")
-                    print(f"  Emb_Cos_Sim: {avg_cos_sim:.4f} | Emb_Center_Dist: {center_dist:.4f}")
-                    print(f"  Weighted_Eval_BCE_Loss: {weighted_eval_bce_loss.item():.4f} | Weighted_Eval_Uniformity_Loss: {weighted_eval_uniformity_loss.item():.4f}")
-                    print(f"  Weighted_Eval_Rec_Loss: {weighted_eval_rec_loss.item():.4f}")
+                    # 记录诊断指标到wandb并打印
+                    log_diagnostics(metrics, epoch, current_lr, use_wandb=True)
             else: 
                 emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, _, con_loss, proj_loss, reconstruction_loss = model(concated_input_features, adj, normal_for_generation_idx, normal_for_train_idx,
                                                                         train_flag, args)
