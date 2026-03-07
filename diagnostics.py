@@ -29,6 +29,11 @@ class DiagnosticMetrics:
     emb_cos_sim: float      # 正常节点embedding的平均余弦相似度（检测塌缩）
     emb_center_dist: float   # 正常与异常节点中心的欧氏距离
     
+    # 特征中心距离指标（新增）
+    dist_Nreal_Areal: Optional[float] = None    # 真正常与真异常的特征中心距离
+    dist_Nreal_Apseudo: Optional[float] = None  # 真正常与伪异常的特征中心距离
+    dist_Areal_Apseudo: Optional[float] = None  # 真异常与伪异常的特征中心距离
+    
     # Loss指标（可选）
     weighted_bce_loss: Optional[float] = None
     weighted_uniformity_loss: Optional[float] = None
@@ -122,12 +127,64 @@ class DiagnosticCalculator:
         
         return avg_cos_sim, center_dist
     
+    def compute_center_distances(
+        self,
+        embeddings: torch.Tensor,
+        labels: np.ndarray,
+        outlier_emb: Optional[torch.Tensor] = None
+    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """
+        计算特征中心距离指标
+        
+        Args:
+            embeddings: 测试集节点的embedding张量 [N, D]
+            labels: 测试集标签数组 [N], 0表示正常, 1表示异常
+            outlier_emb: 伪异常节点的embedding张量 [M, D]（可选）
+            
+        Returns:
+            dist_Nreal_Areal: 真正常与真异常的特征中心距离
+            dist_Nreal_Apseudo: 真正常与伪异常的特征中心距离
+            dist_Areal_Apseudo: 真异常与伪异常的特征中心距离
+        """
+        # 确保embeddings在CPU上
+        embs_cpu = embeddings.cpu()
+        
+        # 划分真正常和真异常节点
+        norm_mask = (labels == 0)
+        abnorm_mask = (labels == 1)
+        
+        norm_embs = embs_cpu[norm_mask]  # 真正常节点
+        abnorm_embs = embs_cpu[abnorm_mask]  # 真异常节点
+        
+        # 计算真正常和真异常的特征中心
+        norm_center = norm_embs.mean(dim=0)  # N_real 的中心
+        abnorm_center = abnorm_embs.mean(dim=0)  # A_real 的中心
+        
+        # Dist(N_real, A_real): 真正常与真异常的特征中心距离
+        dist_Nreal_Areal = torch.norm(norm_center - abnorm_center, p=2).item()
+        
+        # 如果没有提供伪异常embedding，则只返回第一个距离
+        if outlier_emb is None or outlier_emb.size(0) == 0:
+            return dist_Nreal_Areal, None, None
+        
+        # 计算伪异常的特征中心
+        pseudo_center = outlier_emb.cpu().mean(dim=0)  # A_pseudo 的中心
+        
+        # Dist(N_real, A_pseudo): 真正常与伪异常的特征中心距离
+        dist_Nreal_Apseudo = torch.norm(norm_center - pseudo_center, p=2).item()
+        
+        # Dist(A_real, A_pseudo): 真异常与伪异常的特征中心距离
+        dist_Areal_Apseudo = torch.norm(abnorm_center - pseudo_center, p=2).item()
+        
+        return dist_Nreal_Areal, dist_Nreal_Apseudo, dist_Areal_Apseudo
+    
     def compute_all_metrics(
         self,
         logits: torch.Tensor,
         embeddings: torch.Tensor,
         labels: np.ndarray,
         test_indices: np.ndarray,
+        outlier_emb: Optional[torch.Tensor] = None,
         bce_loss: Optional[float] = None,
         uniformity_loss: Optional[float] = None,
         rec_loss: Optional[float] = None,
@@ -163,6 +220,11 @@ class DiagnosticCalculator:
         # 计算Embedding分析指标
         emb_cos_sim, emb_center_dist = self.compute_embedding_analysis(embeddings, test_labels)
         
+        # 计算特征中心距离指标
+        dist_Nreal_Areal, dist_Nreal_Apseudo, dist_Areal_Apseudo = self.compute_center_distances(
+            embeddings, test_labels, outlier_emb
+        )
+        
         # 计算加权loss（如果提供了loss值和权重）
         weighted_bce_loss = None
         weighted_uniformity_loss = None
@@ -180,6 +242,9 @@ class DiagnosticCalculator:
             logit_std=logit_std,
             emb_cos_sim=emb_cos_sim,
             emb_center_dist=emb_center_dist,
+            dist_Nreal_Areal=dist_Nreal_Areal,
+            dist_Nreal_Apseudo=dist_Nreal_Apseudo,
+            dist_Areal_Apseudo=dist_Areal_Apseudo,
             weighted_bce_loss=weighted_bce_loss,
             weighted_uniformity_loss=weighted_uniformity_loss,
             weighted_rec_loss=weighted_rec_loss
@@ -214,6 +279,14 @@ def log_diagnostics(
         "Diag/Emb_Center_Dist": metrics.emb_center_dist
     }
     
+    # 添加特征中心距离指标（如果有）
+    if metrics.dist_Nreal_Areal is not None:
+        log_dict["Diag/Dist_Nreal_Areal"] = metrics.dist_Nreal_Areal
+    if metrics.dist_Nreal_Apseudo is not None:
+        log_dict["Diag/Dist_Nreal_Apseudo"] = metrics.dist_Nreal_Apseudo
+    if metrics.dist_Areal_Apseudo is not None:
+        log_dict["Diag/Dist_Areal_Apseudo"] = metrics.dist_Areal_Apseudo
+    
     # 添加loss指标（如果有）
     if metrics.weighted_bce_loss is not None:
         log_dict["Diag/Weighted_BCE_Loss"] = metrics.weighted_bce_loss
@@ -227,6 +300,16 @@ def log_diagnostics(
     print(f"  AUC: {metrics.auc:.4f} | AP: {metrics.ap:.4f} | LR: {current_lr:.6f}")
     print(f"  Logit_Margin: {metrics.logit_margin:.4f} | Logit_Std: {metrics.logit_std:.4f}")
     print(f"  Emb_Cos_Sim: {metrics.emb_cos_sim:.4f} | Emb_Center_Dist: {metrics.emb_center_dist:.4f}")
+    
+    # 打印特征中心距离指标
+    if metrics.dist_Nreal_Areal is not None:
+        print(f"  Dist(N_real, A_real): {metrics.dist_Nreal_Areal:.4f}", end="")
+        if metrics.dist_Nreal_Apseudo is not None:
+            print(f" | Dist(N_real, A_pseudo): {metrics.dist_Nreal_Apseudo:.4f}", end="")
+        if metrics.dist_Areal_Apseudo is not None:
+            print(f" | Dist(A_real, A_pseudo): {metrics.dist_Areal_Apseudo:.4f}")
+        else:
+            print()  # 换行
     
     if metrics.weighted_bce_loss is not None:
         print(f"  Weighted_BCE_Loss: {metrics.weighted_bce_loss:.4f} | "

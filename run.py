@@ -178,6 +178,7 @@ def train(args):
             batched_bce_loss = 0
             batched_rec_loss = 0
             batched_uniformity_loss = 0
+            last_outlier_emb = None  # 保存最后一个batch的伪异常embedding用于诊断
             # start_time = time.time()
             for batch_idx, item in enumerate(train_data_loader):
                 # print(f"time to start batch {time.time() - start_time}")
@@ -209,6 +210,10 @@ def train(args):
                 batched_bce_loss += loss_bce
                 batched_rec_loss += loss_rec
                 batched_uniformity_loss += loss_uniformity
+                
+                # 保存最后一个batch的伪异常embedding用于诊断
+                if outlier_emb is not None:
+                    last_outlier_emb = outlier_emb.detach()
 
             batched_total_loss = batched_bce_loss + batched_rec_loss + batched_uniformity_loss
             end_time = time.time()
@@ -345,13 +350,14 @@ def train(args):
                     concatenated_logits = torch.cat(all_batched_logits, dim=0)
                     concatenated_embs = torch.cat(all_batched_embs, dim=0)
                     
-                    # 使用诊断模块计算所有诊断指标（使用训练阶段的loss）
+                    # 使用诊断模块计算所有诊断指标（使用训练阶段的loss和伪异常embedding）
                     diagnostic_calculator = DiagnosticCalculator(device)
                     metrics = diagnostic_calculator.compute_all_metrics(
                         logits=concatenated_logits,
                         embeddings=concatenated_embs,
                         labels=ano_label,
                         test_indices=np.array(idx_test),
+                        outlier_emb=last_outlier_emb,  # 传递训练阶段的伪异常embedding
                         bce_loss=avg_train_bce_loss.item(),
                         uniformity_loss=avg_train_uniformity_loss.item(),
                         rec_loss=avg_train_rec_loss.item(),
