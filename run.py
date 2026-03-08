@@ -1,6 +1,5 @@
 import torch.nn as nn
 
-from model import Model
 from MatrixGAD import MatrixGAD
 from utils import *
 
@@ -70,12 +69,6 @@ def train(args):
     
         num_nodes = features.shape[0]
         ft_size = features.shape[1]
-        if args.model_type == 'GGAD':
-            raw_adj = adj
-            #print(adj.sum())
-            raw_adj = (raw_adj + sp.eye(raw_adj.shape[0])).todense()
-            raw_adj = torch.FloatTensor(raw_adj[np.newaxis])
-            raw_adj = raw_adj.to(device)
 
         adj = normalize_adj(adj)
         adj = (adj + sp.eye(adj.shape[0])).todense()
@@ -87,12 +80,6 @@ def train(args):
         adj = torch.FloatTensor(adj[np.newaxis])
         labels = torch.FloatTensor(labels[np.newaxis])
 
-        # 将数据移动到指定设备
-        if args.model_type != 'MatrixGAD':
-            features = features.to(device)
-            adj = adj.to(device)
-            labels = labels.to(device)
-
         # concated_input_features.shape: torch.Size([1, node_num, 2 * feature_dim])
 
         # idx_train = torch.LongTensor(idx_train)
@@ -100,16 +87,9 @@ def train(args):
         # idx_test = torch.LongTensor(idx_test)
 
         # Initialize model and optimiser
-
-        if args.model_type == 'MatrixGAD':
-            concated_input_features = nagphormer_tokenization(features.squeeze(0), adj.squeeze(0), args)
-            print("check_token_collapse!:", check_token_collapse(concated_input_features))
-            model = MatrixGAD(ft_size, args.embedding_dim, 'prelu', args)
-        elif args.model_type == 'GGAD':
-            concated_input_features = features.to(device)
-            model = Model(ft_size, args.embedding_dim, 'prelu', args.negsamp_ratio, args.readout, args)
-        else:
-            raise ValueError(f"Invalid model type: {args.model_type}")
+        concated_input_features = nagphormer_tokenization(features.squeeze(0), adj.squeeze(0), args)
+        print("check_token_collapse!:", check_token_collapse(concated_input_features))
+        model = MatrixGAD(ft_size, args.embedding_dim, 'prelu', args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay)
     lr_scheduler = PolynomialDecayLR(
@@ -132,38 +112,37 @@ def train(args):
     best_model_state = None
     best_epoch = 0
     
-    if args.model_type == "MatrixGAD":
-        labels = labels.squeeze(0)
+    labels = labels.squeeze(0)
 
-        all_node_indices = torch.arange(num_nodes)
+    all_node_indices = torch.arange(num_nodes)
 
-        # 在半监督场景中，模型训练时允许访问全图的 feature 和被 normal_for_train_idx 允许的那些 label
-        # 为了形式统一，这里将全图的 label 也提供给 Dataset，但是在实际训练中，只有 normal_for_train_idx 的那些 label 允许被使用！
-        # 其中 all_node_indices 是用于计算 batch 内部的 normal_for_train_idx 的
-        batch_data_train = Data.TensorDataset(concated_input_features, labels, all_node_indices)
-        batch_data_val = Data.TensorDataset(concated_input_features[idx_val], labels[idx_val])
-        batch_data_test = Data.TensorDataset(concated_input_features[idx_test], labels[idx_test])
+    # 在半监督场景中，模型训练时允许访问全图的 feature 和被 normal_for_train_idx 允许的那些 label
+    # 为了形式统一，这里将全图的 label 也提供给 Dataset，但是在实际训练中，只有 normal_for_train_idx 的那些 label 允许被使用！
+    # 其中 all_node_indices 是用于计算 batch 内部的 normal_for_train_idx 的
+    batch_data_train = Data.TensorDataset(concated_input_features, labels, all_node_indices)
+    batch_data_val = Data.TensorDataset(concated_input_features[idx_val], labels[idx_val])
+    batch_data_test = Data.TensorDataset(concated_input_features[idx_test], labels[idx_test])
 
-        # 对于训练集需要分层采样
+    # 对于训练集需要分层采样
 
-        all_indices = set(range(num_nodes))
-        known_indices = set(normal_for_train_idx)
-        unknown_indices = list(all_indices - known_indices)
+    all_indices = set(range(num_nodes))
+    known_indices = set(normal_for_train_idx)
+    unknown_indices = list(all_indices - known_indices)
 
-        weights = torch.zeros(num_nodes)
-        weights[normal_for_train_idx] = 1.0 / len(normal_for_train_idx)
-        weights[unknown_indices] = 1.0 / len(unknown_indices)
+    weights = torch.zeros(num_nodes)
+    weights[normal_for_train_idx] = 1.0 / len(normal_for_train_idx)
+    weights[unknown_indices] = 1.0 / len(unknown_indices)
 
-        # 基于权重，实例化一个采样器
-        # replacement=True 允许重复采样，这对于过采样少数类至关重要
-        sampler = Data.WeightedRandomSampler(weights, num_samples=num_nodes, replacement=True)
+    # 基于权重，实例化一个采样器
+    # replacement=True 允许重复采样，这对于过采样少数类至关重要
+    sampler = Data.WeightedRandomSampler(weights, num_samples=num_nodes, replacement=True)
 
 
-        train_data_loader = Data.DataLoader(batch_data_train, batch_size=args.batch_size, sampler=sampler, num_workers=0, pin_memory=False)
-        val_data_loader = Data.DataLoader(batch_data_val, batch_size=args.batch_size, shuffle = False)
-        test_data_loader = Data.DataLoader(batch_data_test, batch_size=args.batch_size, shuffle = False)
+    train_data_loader = Data.DataLoader(batch_data_train, batch_size=args.batch_size, sampler=sampler, num_workers=0, pin_memory=False)
+    val_data_loader = Data.DataLoader(batch_data_val, batch_size=args.batch_size, shuffle = False)
+    test_data_loader = Data.DataLoader(batch_data_test, batch_size=args.batch_size, shuffle = False)
 
-        normal_for_train_idx = torch.tensor(normal_for_train_idx, dtype=torch.long, device=device)
+    normal_for_train_idx = torch.tensor(normal_for_train_idx, dtype=torch.long, device=device)
 
 
     # Train model
@@ -175,158 +154,80 @@ def train(args):
         start_time = time.time()
         train_flag = True
         model.train()
-        if args.model_type == "MatrixGAD":
-            batched_bce_loss = 0
-            batched_rec_loss = 0
-            batched_ring_loss = 0
-            # start_time = time.time()
-            for batch_idx, item in enumerate(train_data_loader):
-                # print(f"time to start batch {time.time() - start_time}")
-                concated_input_features = item[0].to(device)
-                labels = item[1].to(device)
-                batch_global_indices = item[2].to(device)
+        batched_bce_loss = 0
+        batched_rec_loss = 0
+        batched_ring_loss = 0
+        # start_time = time.time()
+        for batch_idx, item in enumerate(train_data_loader):
+            # print(f"time to start batch {time.time() - start_time}")
+            concated_input_features = item[0].to(device)
+            labels = item[1].to(device)
+            batch_global_indices = item[2].to(device)
 
-                optimizer.zero_grad()
-                is_known_normal_mask = torch.isin(batch_global_indices, normal_for_train_idx)
-                local_normal_for_train_idx = torch.nonzero(is_known_normal_mask, as_tuple=False).squeeze(-1)
-                emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring = model(concated_input_features, None,
-                                                                    None, local_normal_for_train_idx,
-                                                                    train_flag, args)
-                    # BCE loss
-                lbl = torch.unsqueeze(torch.cat(
-                    (torch.zeros(len(local_normal_for_train_idx)), torch.ones(len(outlier_emb)))),
-                    1).unsqueeze(0)
-                lbl = lbl.to(device)  # 将标签移动到指定设备
-                loss_bce = b_xent(logits, lbl)
-                loss_bce = torch.mean(loss_bce)
-
-                diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
-                # loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
-
-                loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring
-
-                loss.backward()
-                optimizer.step()
-                batched_bce_loss += loss_bce
-                batched_rec_loss += loss_rec
-                batched_ring_loss += loss_ring
-
-            batched_total_loss = batched_bce_loss + batched_rec_loss + batched_ring_loss
-            end_time = time.time()
-            total_time += end_time - start_time
-            
-            # 获取当前学习率
-            current_lr = optimizer.param_groups[0]['lr']
-            
-            # 更新进度条信息
-            pbar.set_postfix({
-                'Time': f'{total_time:.1f}s',
-                'Epoch': f'{epoch+1}/{args.num_epoch}',
-                'AUC': f'{auc:.4f}',
-                'AP': f'{ap:.4f}'
-            })
-            pbar.update(1)
-            if epoch % 2 == 0:
-                wandb.log({ "batched_total_loss": batched_total_loss.item(),
-                            "bce_loss": batched_bce_loss.item(),
-                            "rec_loss": batched_rec_loss.item(),
-                            "ring_loss": batched_ring_loss.item(),
-                            "learning_rate": current_lr}, step=epoch)
-        else:
             optimizer.zero_grad()
-
-            # print("start forward")
-            emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, _, con_loss, proj_loss, reconstruction_loss = model(concated_input_features, adj,
-                                                                    normal_for_generation_idx, normal_for_train_idx,
-                                                                    train_flag, args)
-
+            is_known_normal_mask = torch.isin(batch_global_indices, normal_for_train_idx)
+            local_normal_for_train_idx = torch.nonzero(is_known_normal_mask, as_tuple=False).squeeze(-1)
+            emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring = model(concated_input_features, None,
+                                                                None, local_normal_for_train_idx,
+                                                                train_flag, args)
             # BCE loss
             lbl = torch.unsqueeze(torch.cat(
-                (torch.zeros(len(normal_for_train_idx)), torch.ones(len(outlier_emb)))),
+                (torch.zeros(len(local_normal_for_train_idx)), torch.ones(len(outlier_emb)))),
                 1).unsqueeze(0)
             lbl = lbl.to(device)  # 将标签移动到指定设备
-
             loss_bce = b_xent(logits, lbl)
             loss_bce = torch.mean(loss_bce)
-            if args.model_type == 'GGAD':
-            # Local affinity margin loss
-                emb = torch.squeeze(emb)
-
-                emb_inf = torch.norm(emb, dim=-1, keepdim=True)
-                emb_inf = torch.pow(emb_inf, -1)
-                emb_inf[torch.isinf(emb_inf)] = 0.
-                emb_norm = emb * emb_inf
-
-                sim_matrix = torch.mm(emb_norm, emb_norm.T)
-                raw_adj = torch.squeeze(raw_adj)
-                similar_matrix = sim_matrix * raw_adj
-
-                r_inv = torch.pow(torch.sum(raw_adj, 0), -1)
-                r_inv[torch.isinf(r_inv)] = 0.
-                affinity = torch.sum(similar_matrix, 0) * r_inv
-
-                affinity_normal_mean = torch.mean(affinity[normal_for_train_idx])
-                affinity_abnormal_mean = torch.mean(affinity[normal_for_generation_idx])
-
-                loss_margin = (args.confidence_margin - (affinity_normal_mean - affinity_abnormal_mean)).clamp_min(min=0)
-            else:
-                loss_margin = torch.tensor(0.0)
 
             diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
-            loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
+            # loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
 
-            loss = dynamic_weights['margin_loss_weight'] * loss_margin + dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['con_loss_weight'] * con_loss + dynamic_weights['proj_loss_weight'] * proj_loss + dynamic_weights['reconstruction_loss_weight'] * reconstruction_loss
+            loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring
 
             loss.backward()
             optimizer.step()
-            end_time = time.time()
-            total_time += end_time - start_time
-            
-            # 获取当前学习率
-            current_lr = optimizer.param_groups[0]['lr']
-            
-            # 更新进度条信息
-            pbar.set_postfix({
-                'Time': f'{total_time:.1f}s',
-                'Epoch': f'{epoch+1}/{args.num_epoch}',
-                'AUC': f'{auc:.4f}',
-                'AP': f'{ap:.4f}'
-            })
-            pbar.update(1)
-            if epoch % 2 == 0:
-                wandb.log({ "margin_loss": loss_margin.item(),
-                            "bce_loss": loss_bce.item(),
-                            "rec_loss": loss_rec.item(),
-                            "con_loss": con_loss.item(),
-                            "proj_loss": proj_loss.item(),
-                            "train_loss": loss.item(),
-                            "reconstruction_loss": reconstruction_loss.item(),
-                            "learning_rate": current_lr}, step=epoch)
+            batched_bce_loss += loss_bce
+            batched_rec_loss += loss_rec
+            batched_ring_loss += loss_ring
+
+        batched_total_loss = batched_bce_loss + batched_rec_loss + batched_ring_loss
+        end_time = time.time()
+        total_time += end_time - start_time
+        
+        # 获取当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # 更新进度条信息
+        pbar.set_postfix({
+            'Time': f'{total_time:.1f}s',
+            'Epoch': f'{epoch+1}/{args.num_epoch}',
+            'AUC': f'{auc:.4f}',
+            'AP': f'{ap:.4f}'
+        })
+        pbar.update(1)
+        if epoch % 2 == 0:
+            wandb.log({ "batched_total_loss": batched_total_loss.item(),
+                        "bce_loss": batched_bce_loss.item(),
+                        "rec_loss": batched_rec_loss.item(),
+                        "ring_loss": batched_ring_loss.item(),
+                        "learning_rate": current_lr}, step=epoch)
         lr_scheduler.step()
         if epoch % 10 == 0:
             model.eval()
             train_flag = False
 
-            if args.model_type == "MatrixGAD":
-                all_batched_logits = []
-                with torch.no_grad():
-                    for _, item in enumerate(test_data_loader):
-                        concated_input_features = item[0].to(device)
-                        labels = item[1].to(device)
-                        emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring = model(concated_input_features, None, None, None,
-                                                                                train_flag, args)
-                        all_batched_logits.append(logits.squeeze(0))
-                    # Concatenate all batched logits
-                    concatenated_logits = torch.cat(all_batched_logits, dim=0)
-                    logits = np.squeeze(concatenated_logits.cpu().detach().numpy())
-                    auc = roc_auc_score(ano_label[idx_test], logits)
-                    ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
-            else: 
-                emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, _, con_loss, proj_loss, reconstruction_loss = model(concated_input_features, adj, normal_for_generation_idx, normal_for_train_idx,
-                                                                        train_flag, args)
-                logits = np.squeeze(logits[:, idx_test, :].cpu().detach().numpy())
-            auc = roc_auc_score(ano_label[idx_test], logits)
-            ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
+            all_batched_logits = []
+            with torch.no_grad():
+                for _, item in enumerate(test_data_loader):
+                    concated_input_features = item[0].to(device)
+                    labels = item[1].to(device)
+                    emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring = model(concated_input_features, None, None, None,
+                                                                            train_flag, args)
+                    all_batched_logits.append(logits.squeeze(0))
+                # Concatenate all batched logits
+                concatenated_logits = torch.cat(all_batched_logits, dim=0)
+                logits = np.squeeze(concatenated_logits.cpu().detach().numpy())
+                auc = roc_auc_score(ano_label[idx_test], logits)
+                ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
             wandb.log({"AUC": auc, "AP": ap}, step=epoch)
             
             # 检查是否为最佳模型
@@ -349,21 +250,13 @@ def train(args):
             for _, item in enumerate(test_data_loader):
                 concated_input_features = item[0].to(device)
                 labels = item[1].to(device)
-                emb_last_epoch, _, _, outlier_emb_last_epoch, _, _, _, _, _, _ = model(concated_input_features, None, None, local_normal_for_train_idx, train_flag, args)
-                # 再运行最佳模型的模型
-                # model.load_state_dict(best_model_state)
-                # emb_best_epoch, _, _, outlier_emb_best_epoch, _, agg_attention_weights_best_epoch, _, _, _ = model(concated_input_features, adj, normal_for_generation_idx, normal_for_train_idx, train_flag, args)
+                emb_last_epoch, _, _, outlier_emb_last_epoch, _, _, _ = model(concated_input_features, None, None, local_normal_for_train_idx, train_flag, args)
                 create_tsne_visualization(concated_input_features[:, 0, :], emb_last_epoch, labels, best_epoch, normal_for_train_idx, outlier_emb_last_epoch, args)
                 break
             
             # 创建tsne可视化
-            
-            
-            # 可视化注意力权重
-            if args.model_type == 'MatrixGAD':
-                # 获取邻接矩阵（去掉batch维度）
-                adj_matrix_np = adj.squeeze(0).detach().cpu().numpy()
-                # attention_stats = visualize_attention_weights(agg_attention_weights_last_epoch, labels, normal_for_train_idx, normal_for_generation_idx, outlier_emb_last_epoch, best_epoch, args.dataset, device, adj_matrix_np, args)
+            # 获取邻接矩阵（去掉batch维度）
+            adj_matrix_np = adj.squeeze(0).detach().cpu().numpy()
         
         
 
