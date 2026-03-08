@@ -17,6 +17,7 @@ from visualization import create_tsne_visualization, visualize_attention_weights
 from utils import send_notification
 
 from playground import check_token_collapse
+from diagnostics import compute_diagnostics, print_diagnostics
 
 
 # os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -229,6 +230,17 @@ def train(args):
                 auc = roc_auc_score(ano_label[idx_test], logits)
                 ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
             wandb.log({"AUC": auc, "AP": ap}, step=epoch)
+            
+            # ==========================================
+            # 计算并打印诊断指标
+            # ==========================================
+            diagnostics = compute_diagnostics(model, test_data_loader, ano_label, idx_test, device, args)
+            losses = {
+                'bce': batched_bce_loss.item(),
+                'rec': batched_rec_loss.item(),
+                'ring': batched_ring_loss.item()
+            }
+            print_diagnostics(diagnostics, epoch, current_lr=current_lr, losses=losses, dynamic_weights=dynamic_weights)
             
             # 检查是否为最佳模型
             if auc > best_AUC and ap > best_AP:
