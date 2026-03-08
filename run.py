@@ -161,6 +161,7 @@ def train(args):
         batched_bce_loss = 0
         batched_rec_loss = 0
         batched_ring_loss = 0
+        batched_ortho_loss = 0
         # start_time = time.time()
         for batch_idx, item in enumerate(train_data_loader):
             # print(f"time to start batch {time.time() - start_time}")
@@ -171,7 +172,7 @@ def train(args):
             optimizer.zero_grad()
             is_known_normal_mask = torch.isin(batch_global_indices, normal_for_train_idx)
             local_normal_for_train_idx = torch.nonzero(is_known_normal_mask, as_tuple=False).squeeze(-1)
-            emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring = model(concated_input_features, None,
+            emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss = model(concated_input_features, None,
                                                                 None, local_normal_for_train_idx,
                                                                 train_flag, args)
             # BCE loss
@@ -185,15 +186,17 @@ def train(args):
             diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
             # loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
 
-            loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring
+            # 添加正交损失到总损失（使用动态权重）
+            loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring + dynamic_weights['ortho_loss_weight'] * ortho_loss
 
             loss.backward()
             optimizer.step()
             batched_bce_loss += loss_bce
             batched_rec_loss += loss_rec
             batched_ring_loss += loss_ring
+            batched_ortho_loss += ortho_loss
 
-        batched_total_loss = batched_bce_loss + batched_rec_loss + batched_ring_loss
+        batched_total_loss = batched_bce_loss + batched_rec_loss + batched_ring_loss + batched_ortho_loss
         end_time = time.time()
         total_time += end_time - start_time
         
@@ -213,6 +216,7 @@ def train(args):
                         "bce_loss": batched_bce_loss.item(),
                         "rec_loss": batched_rec_loss.item(),
                         "ring_loss": batched_ring_loss.item(),
+                        "ortho_loss": batched_ortho_loss.item(),
                         "learning_rate": current_lr}, step=epoch)
         lr_scheduler.step()
         if epoch % 10 == 0:
@@ -224,7 +228,7 @@ def train(args):
                 for _, item in enumerate(test_data_loader):
                     concated_input_features = item[0].to(device)
                     labels = item[1].to(device)
-                    emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring = model(concated_input_features, None, None, None,
+                    emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss = model(concated_input_features, None, None, None,
                                                                             train_flag, args)
                     all_batched_logits.append(logits.squeeze(0))
                 # Concatenate all batched logits
@@ -241,9 +245,10 @@ def train(args):
             losses = {
                 'bce': batched_bce_loss.item(),
                 'rec': batched_rec_loss.item(),
-                'ring': batched_ring_loss.item()
+                'ring': batched_ring_loss.item(),
+                'ortho': batched_ortho_loss.item()
             }
-            print_diagnostics(diagnostics, epoch, current_lr=current_lr, losses=losses, dynamic_weights=dynamic_weights)
+            print_diagnostics(diagnostics, epoch, current_lr=current_lr, losses=losses, dynamic_weights=dynamic_weights, ortho_loss_weight=args.ortho_loss_weight)
             
             # 检查是否为最佳模型
             if auc > best_AUC and ap > best_AP:
@@ -265,7 +270,7 @@ def train(args):
             for _, item in enumerate(test_data_loader):
                 concated_input_features = item[0].to(device)
                 labels = item[1].to(device)
-                emb_last_epoch, _, _, outlier_emb_last_epoch, _, _, _ = model(concated_input_features, None, None, local_normal_for_train_idx, train_flag, args)
+                emb_last_epoch, _, _, outlier_emb_last_epoch, _, _, _, _ = model(concated_input_features, None, None, local_normal_for_train_idx, train_flag, args)
                 create_tsne_visualization(concated_input_features[:, 0, :], emb_last_epoch, labels, best_epoch, normal_for_train_idx, outlier_emb_last_epoch, args)
                 break
             
@@ -346,7 +351,10 @@ if __name__ == "__main__":
     
     parser.add_argument('--con_loss_temp', type=float, default=10)
     parser.add_argument('--GNA_temp', type=float, default=1)
-    
+
+    # Prompt Token 相关参数
+    parser.add_argument('--num_prompts', type=int, default=8, help='Number of learnable prompt tokens for frequency domain views')
+    parser.add_argument('--ortho_loss_weight', type=float, default=0.1, help='Weight for orthogonal loss of prompt tokens')
 
     parser.add_argument('--warmup_updates', type=int, default=50)
     parser.add_argument('--tot_updates', type=int, default=1000)
