@@ -103,7 +103,7 @@ def train(args):
         # Initialize model and optimiser
 
         if args.model_type == 'MatrixGAD':
-            concated_input_features = krylov_orthogonal_tokenization(features.squeeze(0), adj.squeeze(0), args)
+            concated_input_features = nagphormer_tokenization(features.squeeze(0), adj.squeeze(0), args)
             print("check_token_collapse!:", check_token_collapse(concated_input_features))
             model = MatrixGAD(ft_size, args.embedding_dim, 'prelu', args)
         elif args.model_type == 'SGT':
