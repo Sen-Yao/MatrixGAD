@@ -385,10 +385,38 @@ class MatrixGAD(nn.Module):
                 normal_for_generation_idx
             )
             
-            # ========== Context-Ego Mismatching (唯一的伪异常生成策略) ==========
-            perm_idx = torch.randperm(normal_tokens.size(0), device=self.device)
+            # ========== Context-Ego Mismatching (微小异常生成策略) ==========
+            # 从 T1-T3 中随机选择一个 token 进行加权错配，生成更"微小"的异常点
+            batch_size = normal_tokens.size(0)
+            perm_idx = torch.randperm(batch_size, device=self.device)
             mismatched_tokens = normal_tokens.clone()
-            mismatched_tokens[:, 1:, :] = normal_tokens[perm_idx, 1:, :]
+            
+            # 获取 mismatch_rate 参数，控制错配强度 (默认 0.1)
+            mismatch_rate = getattr(args, 'mismatch_rate', 0.3)
+            
+            # 随机选择要错配的 token 位置 (1, 2, 或 3，对应 T1, T2, T3)
+            token_positions = torch.randint(1, 4, (batch_size,), device=self.device)
+            
+            # 创建 one-hot mask 标记哪些位置需要错配
+            # positions_one_hot: [batch_size, 3] - 每行有一个1，表示要错配的位置
+            positions_one_hot = F.one_hot(token_positions - 1, num_classes=3).float()  # [batch_size, 3]
+            
+            # 扩展维度以匹配 token 特征维度: [batch_size, 3, 1]
+            positions_one_hot = positions_one_hot.unsqueeze(-1)
+            
+            # 加权错配：只对选中的 token 位置进行加权混合
+            # new_token = (1 - mismatch_rate) * original_token + mismatch_rate * other_token
+            # 对于选中的位置，按 mismatch_rate 比例混合
+            # 对于未选中的位置，保持原节点的 token
+            other_tokens = normal_tokens[perm_idx, 1:, :]
+            original_tokens = normal_tokens[:, 1:, :]
+            blended_tokens = (1 - mismatch_rate) * original_tokens + mismatch_rate * other_tokens
+            
+            mismatched_tokens[:, 1:, :] = (
+                positions_one_hot * blended_tokens + 
+                (1 - positions_one_hot) * original_tokens
+            )
+            
             outlier_emb = self.TransformerEncoder(mismatched_tokens).squeeze(0)
             
             normal_emb = emb[:, normal_for_train_idx, :].squeeze(0)
