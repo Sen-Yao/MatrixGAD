@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from MatrixGAD import MatrixGAD
+from PromptGAD import PromptGAD
 from utils import *
 
 from sklearn.metrics import roc_auc_score
@@ -51,7 +51,7 @@ def train(args):
     if args.dataset == 'dgraph':
         adj, features, labels, all_idx, idx_train, idx_val, idx_test, ano_label, _, _, normal_for_train_idx, normal_for_generation_idx = load_dgraph(train_rate=args.train_rate, val_rate=0.1, args=args)
         concated_input_features = nagphormer_tokenization(features, adj, args)
-        model = MatrixGAD(features.shape[1], args.embedding_dim, 'prelu', args)
+        model = PromptGAD(features.shape[1], args.embedding_dim, 'prelu', args)
         features = features.to(device)
         adj = adj.to(device)
         labels = torch.tensor(labels).to(device)
@@ -90,7 +90,7 @@ def train(args):
         # Initialize model and optimiser
         concated_input_features = nagphormer_tokenization(features.squeeze(0), adj.squeeze(0), args)
         print("check_token_collapse!:", check_token_collapse(concated_input_features))
-        model = MatrixGAD(ft_size, args.embedding_dim, 'prelu', args)
+        model = PromptGAD(ft_size, args.embedding_dim, 'prelu', args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay)
     lr_scheduler = PolynomialDecayLR(
@@ -312,7 +312,7 @@ if __name__ == "__main__":
     parser.add_argument('--outlier_beta', type=float, default=0.3)
     parser.add_argument('--sample_rate', type=float, default=0.15)
     
-    parser.add_argument('--model_type', type=str, default='MatrixGAD')
+    parser.add_argument('--model_type', type=str, default='PromptGAD')
     parser.add_argument('--visualize', type=bool, default=False)
     parser.add_argument('--device', type=int, default=0)
 
