@@ -2,7 +2,6 @@ import torch.nn as nn
 
 from model import Model
 from MatrixGAD import MatrixGAD
-from SGT import SGT
 from utils import *
 
 from sklearn.metrics import roc_auc_score
@@ -106,17 +105,6 @@ def train(args):
             concated_input_features = nagphormer_tokenization(features.squeeze(0), adj.squeeze(0), args)
             print("check_token_collapse!:", check_token_collapse(concated_input_features))
             model = MatrixGAD(ft_size, args.embedding_dim, 'prelu', args)
-        elif args.model_type == 'SGT':
-            concated_input_features = preprocess_sample_features(args, features.squeeze(0), adj.squeeze(0)).to(device)
-            model = SGT(n_layers=args.GT_num_layers,
-                input_dim=concated_input_features.shape[-1],
-                hidden_dim=args.embedding_dim,
-                n_class=2,
-                num_heads=args.GT_num_heads,
-                ffn_dim=args.GT_ffn_dim,
-                dropout_rate=args.GT_dropout,
-                attention_dropout_rate=args.GT_attention_dropout,
-                args=args).to(device)
         elif args.model_type == 'GGAD':
             concated_input_features = features.to(device)
             model = Model(ft_size, args.embedding_dim, 'prelu', args.negsamp_ratio, args.readout, args)
@@ -372,7 +360,7 @@ def train(args):
             
             
             # 可视化注意力权重
-            if args.model_type == 'MatrixGAD' or args.model_type == 'SGT':
+            if args.model_type == 'MatrixGAD':
                 # 获取邻接矩阵（去掉batch维度）
                 adj_matrix_np = adj.squeeze(0).detach().cpu().numpy()
                 # attention_stats = visualize_attention_weights(agg_attention_weights_last_epoch, labels, normal_for_train_idx, normal_for_generation_idx, outlier_emb_last_epoch, best_epoch, args.dataset, device, adj_matrix_np, args)
