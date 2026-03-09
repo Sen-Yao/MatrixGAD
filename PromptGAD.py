@@ -265,12 +265,12 @@ class PromptGAD(nn.Module):
         # 1. 计算重要性 (Magnitude) - 传统的 Softmax
         # score: [B, M, num_hops]
         score_mag = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(d_model)
-        magnitude = F.softmax(score_mag, dim=-1)
+        magnitude = F.softmax(score_mag / self.args.tokenizer_temp, dim=-1)
 
         # 2. 计算方向/突变 (Sign) - 打破低通滤波诅咒的关键！
         # range: [-1, 1]
         score_sign = torch.matmul(self.sign_q(Q), self.sign_k(K).transpose(-1, -2))
-        sign = torch.tanh(score_sign / math.sqrt(d_model))
+        sign = torch.tanh(score_sign / self.args.tokenizer_temp)
 
         # 3. 合成动态滤波器权重
         attn_weights = magnitude * sign  # [B, M, num_hops]

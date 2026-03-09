@@ -355,6 +355,7 @@ if __name__ == "__main__":
     # Prompt Token 相关参数
     parser.add_argument('--num_prompts', type=int, default=8, help='Number of learnable prompt tokens for frequency domain views')
     parser.add_argument('--ortho_loss_weight', type=float, default=0.1, help='Weight for orthogonal loss of prompt tokens')
+    parser.add_argument('--tokenizer_temp', type=float, default=0.1, help='Temperature parameter for tokenizer attention computation')
 
     parser.add_argument('--warmup_updates', type=int, default=50)
     parser.add_argument('--tot_updates', type=int, default=1000)
