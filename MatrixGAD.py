@@ -264,6 +264,7 @@ class MatrixGAD(nn.Module):
         outlier_emb = None
         emb_combine = None
         noised_normal_for_generation_emb = None
+        reconstruction_error_proj = None  # 重构误差向量 R_i
 
         gna_loss = torch.tensor(0.0, device=emb.device)
         proj_loss = torch.tensor(0.0, device=emb.device)
@@ -327,6 +328,12 @@ class MatrixGAD(nn.Module):
 
             f_1 = self.fc1(emb_combine)
         else:
+            # 在非训练模式下也计算重构误差向量（用于诊断）
+            reconstructed_tokens = self.token_decoder(emb).squeeze(0)  # [num_nodes, (args.pp_k+1)*n_in]
+            reconstruction_error = reconstructed_tokens - input_tokens.view(-1, (args.pp_k+1) * self.n_in)
+            # Project reconstruction error to embedding dimension for all nodes
+            reconstruction_error_proj = self.reconstruction_proj(reconstruction_error)
+            
             f_1 = self.fc1(emb)
         f_1 = self.act(f_1)
         f_2 = self.fc2(f_1)
@@ -335,7 +342,7 @@ class MatrixGAD(nn.Module):
         emb = emb.clone()
 
         # gna_loss = torch.tensor(0.0, device=emb.device)
-        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring
+        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, reconstruction_error_proj
 
     def compute_rec_loss(self, input_tokens, reconstructed_tokens, normal_for_generation_emb, reencoded_emb, normal_for_generation_idx):
         """

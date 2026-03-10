@@ -28,6 +28,7 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     all_batched_embs = []
     all_outlier_logits = []
     all_outlier_embs = []
+    all_reconstruction_errors = []  # Store reconstruction error vectors
     
     with torch.no_grad():
         for item in data_loader:
@@ -35,12 +36,16 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
             labels = item[1].to(device)
             
             # Get model outputs without pseudo-anomalies (for test set evaluation)
-            emb, emb_combine, logits, _, _, _, _, _ = model(
+            emb, emb_combine, logits, _, _, _, _, _, rec_error = model(
                 concated_input_features, None, None, None, False, args
             )
             
             all_batched_logits.append(logits.squeeze(0))
             all_batched_embs.append(emb.squeeze(0))
+            
+            # Store reconstruction error vectors if available
+            if rec_error is not None:
+                all_reconstruction_errors.append(rec_error.cpu())
             
             # Get pseudo-anomaly logits if normal_for_train_idx is provided
             if normal_for_train_idx is not None:
@@ -56,7 +61,7 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
                     local_normal_idx = torch.arange(num_pseudo, device=device)
                     
                     # Get model outputs with pseudo-anomaly generation
-                    emb_pseudo, emb_combine_pseudo, logits_pseudo, outlier_emb, _, _, _, _ = model(
+                    emb_pseudo, emb_combine_pseudo, logits_pseudo, outlier_emb, _, _, _, _, _ = model(
                         concated_input_features, None, None, local_normal_idx, True, args
                     )
                     
@@ -73,6 +78,12 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     # Concatenate all batched results
     concatenated_logits = torch.cat(all_batched_logits, dim=0)
     concatenated_embs = torch.cat(all_batched_embs, dim=0)
+    
+    # Concatenate reconstruction errors if available
+    if len(all_reconstruction_errors) > 0:
+        concatenated_rec_errors = torch.cat(all_reconstruction_errors, dim=0)
+    else:
+        concatenated_rec_errors = None
     
     # Concatenate outlier results if available
     if len(all_outlier_logits) > 0:
@@ -232,6 +243,89 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
         diagnostics['outlier_closer_to_abnorm'] = False
     
     # ==========================================
+    # Probe 5: Reconstruction Error Vector Magnitude Distribution
+    # ==========================================
+    if concatenated_rec_errors is not None:
+        # 计算所有节点的重构误差向量模长 ||R_i||
+        rec_error_magnitudes = torch.norm(concatenated_rec_errors, p=2, dim=1)
+        
+        # 分别计算正常点和异常点的模长
+        norm_rec_magnitudes = rec_error_magnitudes[norm_mask]
+        abnorm_rec_magnitudes = rec_error_magnitudes[abnorm_mask]
+        
+        # 正常点模长统计
+        if len(norm_rec_magnitudes) > 0:
+            diagnostics['norm_rec_mag_mean'] = norm_rec_magnitudes.mean().item()
+            diagnostics['norm_rec_mag_std'] = norm_rec_magnitudes.std().item()
+            diagnostics['norm_rec_mag_min'] = norm_rec_magnitudes.min().item()
+            diagnostics['norm_rec_mag_max'] = norm_rec_magnitudes.max().item()
+            diagnostics['norm_rec_mag_median'] = norm_rec_magnitudes.median().item()
+            # 计算分位数
+            diagnostics['norm_rec_mag_q25'] = torch.quantile(norm_rec_magnitudes, 0.25).item()
+            diagnostics['norm_rec_mag_q75'] = torch.quantile(norm_rec_magnitudes, 0.75).item()
+        else:
+            diagnostics['norm_rec_mag_mean'] = float('nan')
+            diagnostics['norm_rec_mag_std'] = float('nan')
+            diagnostics['norm_rec_mag_min'] = float('nan')
+            diagnostics['norm_rec_mag_max'] = float('nan')
+            diagnostics['norm_rec_mag_median'] = float('nan')
+            diagnostics['norm_rec_mag_q25'] = float('nan')
+            diagnostics['norm_rec_mag_q75'] = float('nan')
+        
+        # 异常点模长统计
+        if len(abnorm_rec_magnitudes) > 0:
+            diagnostics['abnorm_rec_mag_mean'] = abnorm_rec_magnitudes.mean().item()
+            diagnostics['abnorm_rec_mag_std'] = abnorm_rec_magnitudes.std().item()
+            diagnostics['abnorm_rec_mag_min'] = abnorm_rec_magnitudes.min().item()
+            diagnostics['abnorm_rec_mag_max'] = abnorm_rec_magnitudes.max().item()
+            diagnostics['abnorm_rec_mag_median'] = abnorm_rec_magnitudes.median().item()
+            # 计算分位数
+            diagnostics['abnorm_rec_mag_q25'] = torch.quantile(abnorm_rec_magnitudes, 0.25).item()
+            diagnostics['abnorm_rec_mag_q75'] = torch.quantile(abnorm_rec_magnitudes, 0.75).item()
+        else:
+            diagnostics['abnorm_rec_mag_mean'] = float('nan')
+            diagnostics['abnorm_rec_mag_std'] = float('nan')
+            diagnostics['abnorm_rec_mag_min'] = float('nan')
+            diagnostics['abnorm_rec_mag_max'] = float('nan')
+            diagnostics['abnorm_rec_mag_median'] = float('nan')
+            diagnostics['abnorm_rec_mag_q25'] = float('nan')
+            diagnostics['abnorm_rec_mag_q75'] = float('nan')
+        
+        # 计算模长差异的统计显著性
+        if len(norm_rec_magnitudes) > 0 and len(abnorm_rec_magnitudes) > 0:
+            # 模长差异（异常点模长 - 正常点模长）
+            mag_diff = diagnostics['abnorm_rec_mag_mean'] - diagnostics['norm_rec_mag_mean']
+            diagnostics['rec_mag_diff'] = mag_diff
+            # 模长比率（异常点模长 / 正常点模长）
+            diagnostics['rec_mag_ratio'] = diagnostics['abnorm_rec_mag_mean'] / (diagnostics['norm_rec_mag_mean'] + 1e-8)
+        else:
+            diagnostics['rec_mag_diff'] = float('nan')
+            diagnostics['rec_mag_ratio'] = float('nan')
+        
+        # 存储原始模长数据（用于可视化）
+        diagnostics['norm_rec_magnitudes'] = norm_rec_magnitudes.numpy()
+        diagnostics['abnorm_rec_magnitudes'] = abnorm_rec_magnitudes.numpy()
+    else:
+        diagnostics['norm_rec_mag_mean'] = float('nan')
+        diagnostics['norm_rec_mag_std'] = float('nan')
+        diagnostics['norm_rec_mag_min'] = float('nan')
+        diagnostics['norm_rec_mag_max'] = float('nan')
+        diagnostics['norm_rec_mag_median'] = float('nan')
+        diagnostics['norm_rec_mag_q25'] = float('nan')
+        diagnostics['norm_rec_mag_q75'] = float('nan')
+        diagnostics['abnorm_rec_mag_mean'] = float('nan')
+        diagnostics['abnorm_rec_mag_std'] = float('nan')
+        diagnostics['abnorm_rec_mag_min'] = float('nan')
+        diagnostics['abnorm_rec_mag_max'] = float('nan')
+        diagnostics['abnorm_rec_mag_median'] = float('nan')
+        diagnostics['abnorm_rec_mag_q25'] = float('nan')
+        diagnostics['abnorm_rec_mag_q75'] = float('nan')
+        diagnostics['rec_mag_diff'] = float('nan')
+        diagnostics['rec_mag_ratio'] = float('nan')
+        diagnostics['norm_rec_magnitudes'] = None
+        diagnostics['abnorm_rec_magnitudes'] = None
+    
+    # ==========================================
     # Sample Statistics
     # ==========================================
     diagnostics['num_normal'] = norm_embs.size(0) if norm_embs.size(0) > 0 else 0
@@ -285,3 +379,15 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
         closer_str = "YES" if d['outlier_closer_to_abnorm'] else "NO"
         print(f"  TriGeo: N→O={d['dist_norm_outlier']:.3f}, N→A={d['dist_norm_abnorm']:.3f}, O→A={d['dist_outlier_abnorm']:.3f} | "
               f"angle={d['angle_degrees']:.1f}°, cos_sim={d['cos_sim_directions']:.3f} | outlier→abnorm closer: {closer_str}")
+    
+    # Line 6: Reconstruction Error Vector Magnitude Distribution
+    if not np.isnan(d.get('norm_rec_mag_mean', float('nan'))):
+        print(f"  RecMag: ||R_i|| 分布:")
+        print(f"    正常点: mean={d['norm_rec_mag_mean']:.4f}(±{d['norm_rec_mag_std']:.4f}), "
+              f"median={d['norm_rec_mag_median']:.4f}, [{d['norm_rec_mag_q25']:.4f}, {d['norm_rec_mag_q75']:.4f}], "
+              f"min={d['norm_rec_mag_min']:.4f}, max={d['norm_rec_mag_max']:.4f}")
+        if not np.isnan(d.get('abnorm_rec_mag_mean', float('nan'))):
+            print(f"    异常点: mean={d['abnorm_rec_mag_mean']:.4f}(±{d['abnorm_rec_mag_std']:.4f}), "
+                  f"median={d['abnorm_rec_mag_median']:.4f}, [{d['abnorm_rec_mag_q25']:.4f}, {d['abnorm_rec_mag_q75']:.4f}], "
+                  f"min={d['abnorm_rec_mag_min']:.4f}, max={d['abnorm_rec_mag_max']:.4f}")
+            print(f"    差异: diff={d['rec_mag_diff']:.4f}, ratio={d['rec_mag_ratio']:.4f}x")

@@ -172,7 +172,7 @@ def train(args):
             optimizer.zero_grad()
             is_known_normal_mask = torch.isin(batch_global_indices, normal_for_train_idx)
             local_normal_for_train_idx = torch.nonzero(is_known_normal_mask, as_tuple=False).squeeze(-1)
-            emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss = model(concated_input_features, None,
+            emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, _ = model(concated_input_features, None,
                                                                 None, local_normal_for_train_idx,
                                                                 train_flag, args)
             # BCE loss
@@ -228,7 +228,7 @@ def train(args):
                 for _, item in enumerate(test_data_loader):
                     concated_input_features = item[0].to(device)
                     labels = item[1].to(device)
-                    emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss = model(concated_input_features, None, None, None,
+                    emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, _ = model(concated_input_features, None, None, None,
                                                                             train_flag, args)
                     all_batched_logits.append(logits.squeeze(0))
                 # Concatenate all batched logits
@@ -270,7 +270,7 @@ def train(args):
             for _, item in enumerate(test_data_loader):
                 concated_input_features = item[0].to(device)
                 labels = item[1].to(device)
-                emb_last_epoch, _, _, outlier_emb_last_epoch, _, _, _, _ = model(concated_input_features, None, None, local_normal_for_train_idx, train_flag, args)
+                emb_last_epoch, _, _, outlier_emb_last_epoch, _, _, _, _, _ = model(concated_input_features, None, None, local_normal_for_train_idx, train_flag, args)
                 create_tsne_visualization(concated_input_features[:, 0, :], emb_last_epoch, labels, best_epoch, normal_for_train_idx, outlier_emb_last_epoch, args)
                 break
             

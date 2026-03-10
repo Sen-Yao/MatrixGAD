@@ -390,6 +390,7 @@ class PromptGAD(nn.Module):
         outlier_emb = None
         emb_combine = None
         noised_normal_for_generation_emb = None
+        reconstruction_error_proj = None  # 重构误差向量 R_i
 
         gna_loss = torch.tensor(0.0, device=emb.device)
         proj_loss = torch.tensor(0.0, device=emb.device)
@@ -458,6 +459,13 @@ class PromptGAD(nn.Module):
 
             f_1 = self.fc1(emb_combine)
         else:
+            # 在非训练模式下也计算重构误差向量（用于诊断）
+            reconstructed_tokens = self.token_decoder(emb).squeeze(0)
+            target_tokens = new_tokens.view(-1, self.num_prompts * args.embedding_dim)
+            reconstruction_error = reconstructed_tokens - target_tokens
+            # Project reconstruction error to embedding dimension for all nodes
+            reconstruction_error_proj = self.reconstruction_proj(reconstruction_error)
+            
             f_1 = self.fc1(emb)
         f_1 = self.act(f_1)
         f_2 = self.fc2(f_1)
@@ -465,8 +473,8 @@ class PromptGAD(nn.Module):
         logits = self.fc3(f_2)
         emb = emb.clone()
 
-        # 返回正交损失
-        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss
+        # 返回正交损失和重构误差向量
+        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj
 
     def compute_rec_loss(self, new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx):
         """
