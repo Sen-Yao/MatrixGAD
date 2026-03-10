@@ -216,23 +216,20 @@ class PromptGAD(nn.Module):
         self.sign_q = nn.Linear(args.embedding_dim, args.embedding_dim)
         self.sign_k = nn.Linear(args.embedding_dim, args.embedding_dim)
 
-        # Token 解码器：从 embedding 重构 new_tokens
-        # 输出维度: M * embedding_dim (M 个 prompt tokens，每个维度为 embedding_dim)
-        self.token_decoder = nn.Sequential(
-            nn.Linear(args.embedding_dim, args.embedding_dim),
+        # ============================================================
+        # 新增：带瓶颈的 MLP 自编码器，用于独立重构每个 Token
+        # 针对 Token 内部的压缩与还原，不跨 Token 交流
+        # ============================================================
+        d_bottleneck = args.embedding_dim // 4  # 瓶颈维度
+        self.ae = nn.Sequential(
+            nn.Linear(args.embedding_dim, d_bottleneck),
+            nn.LayerNorm(d_bottleneck),  # 增加稳定性
             nn.ReLU(),
-            nn.Linear(args.embedding_dim, self.num_prompts * args.embedding_dim)
+            nn.Linear(d_bottleneck, args.embedding_dim)
         )
 
         # 重构损失函数
         self.recon_loss_fn = nn.MSELoss()
-
-        # 投影层：将重构误差从 M*embedding_dim 维度投影到 embedding_dim 维度
-        self.reconstruction_proj = nn.Sequential(
-            nn.Linear(self.num_prompts * args.embedding_dim, args.embedding_dim),
-            nn.ReLU(),
-            nn.Linear(args.embedding_dim, args.embedding_dim)
-        )
 
         # 将模型移动到指定设备
         self.to(self.device)
@@ -363,7 +360,14 @@ class PromptGAD(nn.Module):
         return emb
 
     def forward(self, input_tokens, adj, _, normal_for_train_idx, train_flag, args, sparse=False):
-
+        """
+        前向传播
+        
+        主要改动：
+        1. 使用带瓶颈的 MLP 独立重构每个 Token
+        2. 计算精准残差法向生成伪异常
+        3. 移除 Ring 损失
+        """
         # input_tokens: (N, args.pp_k+1, d)
 
         # 使用 tokenizer 提取 M 种不同的"频域视角"特征
@@ -394,65 +398,95 @@ class PromptGAD(nn.Module):
         gna_loss = torch.tensor(0.0, device=emb.device)
         proj_loss = torch.tensor(0.0, device=emb.device)
         uniformity_loss = torch.tensor(0.0, device=emb.device)
-        loss_ring = torch.tensor(0.0, device=emb.device)
         con_loss = torch.tensor(0.0, device=emb.device)
         loss_rec = torch.tensor(0.0, device=emb.device)
+        
         if train_flag:
-            # start_time = time.time()
             # 高效重排
             perm = torch.randperm(normal_for_train_idx.size(0), device=normal_for_train_idx.device)
             normal_for_train_idx = normal_for_train_idx[perm]
-            # print(f"time for shuffle:{time.time() - start_time}")
             normal_for_generation_idx = normal_for_train_idx[: int(len(normal_for_train_idx) * args.sample_rate)]            
             normal_for_generation_emb = emb[:, normal_for_generation_idx, :]
-            # print(f"time for normal_for_generation_emb:{time.time() - start_time}")
-            # Noise
-            noise = torch.randn(normal_for_generation_emb.size(), device=self.device) * args.var + args.mean
-            noised_normal_for_generation_emb = normal_for_generation_emb + noise
-            # print(f"time for noise:{time.time() - start_time}")
-
-            # 重构学习：重构目标是 new_tokens (Prompt Token 提取的频域视角)
-            # reconstructed_tokens: [num_nodes, M * embedding_dim]
-            reconstructed_tokens = self.token_decoder(emb).squeeze(0)
             
-            # 计算重构误差，目标是 new_tokens
-            # new_tokens: [N, M, embedding_dim] -> flatten: [N, M * embedding_dim]
-            target_tokens = new_tokens.view(-1, self.num_prompts * args.embedding_dim)
-            reconstruction_error = reconstructed_tokens - target_tokens
+            # ============================================================
+            # 新的重构方式：使用带瓶颈的 MLP 独立重构每个 Token
+            # ============================================================
             
-            # Project reconstruction error to embedding dimension
-            reconstruction_error_proj = self.reconstruction_proj(reconstruction_error[normal_for_generation_idx, :])
-
-            # Ablation study:
-            if args.ablation_random_dir:
-                # 计算原始扰动向量的模长 (Magnitude)
-                # dim=1 表示计算每个样本向量的范数，keepdim=True 保持形状为 (Batch, 1) 以便广播
-                norms = torch.norm(reconstruction_error_proj, p=2, dim=1, keepdim=True)
-                
-                # 生成同维度的随机向量 (Random Direction)
-                # 从标准正态分布采样
-                random_vec = torch.randn_like(reconstruction_error_proj)
-                
-                # 将随机向量归一化为单位向量 (Unit Vector)
-                random_dir = torch.nn.functional.normalize(random_vec, p=2, dim=1)
-                
-                # 赋予随机方向以原始模长
-                reconstruction_error_proj = norms * random_dir
-
-            outlier_emb = normal_for_generation_emb + args.outlier_beta * reconstruction_error_proj
-            outlier_emb = outlier_emb.squeeze(0)
-
-            # 中心点对齐损失，鼓励离群点距离全局中心的距离保持在一个 ring 内
-            # 计算离群点嵌入与全局中心的距离
-            outlier_to_center_dist = torch.norm(outlier_emb - h_mean.squeeze(0), p=2, dim=1)
-            # 只有超过 confidence_margin 的距离才会产生损失
-            ring_out_range_loss = torch.relu(args.ring_R_min - outlier_to_center_dist)
-            ring_in_range_loss = torch.relu(outlier_to_center_dist - args.ring_R_max)
-
-            loss_ring = torch.mean(ring_out_range_loss + ring_in_range_loss)
+            # 获取用于生成伪异常的正常节点的 new_tokens
+            # new_tokens: [N, M, embedding_dim]
+            original_tokens = new_tokens[normal_for_generation_idx, :, :]  # [B_gen, M, embedding_dim]
             
-            # 计算重构损失：目标是重构 new_tokens
-            loss_rec = self.compute_rec_loss(new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx)
+            # 1. 独立重构每个 Token
+            recon_tokens = self.ae(original_tokens)  # [B_gen, M, embedding_dim]
+            
+            # 2. 计算重构 Loss (全视野，无 Mask)
+            loss_rec = F.mse_loss(recon_tokens, original_tokens)
+            
+            # 3-5. 计算精准残差法向生成伪异常
+            with torch.no_grad():
+                # 3. 计算精准残差法向
+                R = original_tokens - recon_tokens  # [B_gen, M, d]
+                norm = torch.norm(R, p=2, dim=-1, keepdim=True) + 1e-8  # [B_gen, M, 1]
+                
+                # 4. 计算当前 batch 在各个 Token 位置上的动态厚度
+                # shape: [1, M, 1]
+                dynamic_thickness = norm.mean(dim=0, keepdim=True)
+                
+                # 5. 生成高质量伪异常
+                # 顺着重构误差的切线方向，踏出一个系统标准差的厚度
+                direction = R / norm  # [B_gen, M, d]
+                c = args.pseudo_perturbation_scale  # 扰动倍率
+                pseudo_tokens = original_tokens + c * dynamic_thickness * direction  # [B_gen, M, d]
+            
+            # 6. 将 original_tokens 和 pseudo_tokens 送入 GT 进行二分类
+            # 我们需要将 pseudo_tokens 转换为 embedding 空间的伪异常点
+            
+            # 将 original_tokens 和 pseudo_tokens 与原始 projected_original 组合
+            # 然后通过 TransformerEncoder 编码得到 embedding
+            
+            # 获取正常节点的 projected_original tokens
+            normal_projected_original = projected_original[normal_for_generation_idx, :, :]  # [B_gen, pp_k+1, d]
+            
+            # 组合 original_tokens (new_tokens 部分) 与 projected_original
+            # original_combined: [B_gen, pp_k+1 + M, d]
+            original_combined = torch.cat([normal_projected_original, original_tokens], dim=1)
+            
+            # 组合 pseudo_tokens 与 projected_original
+            # pseudo_combined: [B_gen, pp_k+1 + M, d]
+            pseudo_combined = torch.cat([normal_projected_original, pseudo_tokens], dim=1)
+            
+            # 分别编码得到 embedding
+            # 注意：这里我们需要复用 TransformerEncoderWithTokens 的逻辑
+            # 但为了避免重复计算，我们采用更高效的方式
+            
+            # 将两组 tokens 拼接成 batch
+            # combined_for_encoding: [2*B_gen, pp_k+1 + M, d]
+            combined_for_encoding = torch.cat([original_combined, pseudo_combined], dim=0)
+            
+            # 通过 Transformer 编码
+            # 这里我们需要手动实现编码过程，因为 TransformerEncoderWithTokens 期望的是完整输入
+            encoded = combined_for_encoding
+            for i, layer in enumerate(self.layers):
+                encoded, _ = layer(encoded)
+            encoded = self.final_ln(encoded)
+            
+            # 使用第一个 token 的输出作为 embedding (或者使用注意力池化)
+            # 这里我们使用与 TransformerEncoderWithTokens 相同的池化方式
+            # 但为了简化，我们直接取第一个 token 或者使用 mean pooling
+            # encoded: [2*B_gen, pp_k+1 + M, d]
+            
+            # 使用 mean pooling 得到 embedding
+            encoded_emb = encoded.mean(dim=1)  # [2*B_gen, d]
+            
+            # 分离正常和伪异常的 embedding
+            normal_encoded_emb = encoded_emb[:original_tokens.size(0)]  # [B_gen, d]
+            pseudo_encoded_emb = encoded_emb[original_tokens.size(0):]  # [B_gen, d]
+            
+            # 伪异常 embedding
+            outlier_emb = pseudo_encoded_emb
+            
+            # 保存 normal_for_generation_emb 用于后续计算
+            noised_normal_for_generation_emb = normal_encoded_emb.unsqueeze(0)  # [1, B_gen, d]
 
             emb_combine = torch.cat((emb[:, normal_for_train_idx, :], torch.unsqueeze(outlier_emb, 0)), 1)
 
@@ -465,30 +499,8 @@ class PromptGAD(nn.Module):
         logits = self.fc3(f_2)
         emb = emb.clone()
 
-        # 返回正交损失
-        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss
-
-    def compute_rec_loss(self, new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx):
-        """
-        计算 Token 空间的重构损失
-        重构目标是 new_tokens (Prompt Token 提取的频域视角)
-        
-        Args:
-            new_tokens: Prompt Token 提取的新视角 Token [N, M, embedding_dim]
-            reconstructed_tokens: 经过解码器重构的 Token 序列 [N, M * embedding_dim]
-            normal_for_generation_emb: 正常节点的嵌入
-            normal_for_generation_idx: 用于生成异常的正常节点索引
-        Returns:
-            loss_rec: 重构损失值
-        """
-        # 计算重构损失：目标是 new_tokens
-        # new_tokens: [N, M, embedding_dim] -> flatten: [N, M * embedding_dim]
-        target_tokens = new_tokens.view(-1, self.num_prompts * self.args.embedding_dim)
-        
-        # Token 空间的重构损失
-        token_rec_loss = self.recon_loss_fn(reconstructed_tokens, target_tokens)
-        
-        return token_rec_loss
+        # 返回: 移除了 loss_ring
+        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, ortho_loss
 
 
     # InfoNCE uniformity loss - 推开不同正常节点间的距离

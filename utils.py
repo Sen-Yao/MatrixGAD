@@ -709,6 +709,8 @@ def get_dynamic_loss_weights(epoch, args):
     
     Returns:
         dict: 包含各种损失权重的字典
+    
+    注意：已移除 ring_loss_weight，因为 Ring 损失已被移除
     """
     if epoch < args.warmup_epoch:
         # warmup阶段：只开启community_loss和正常节点内部的对比损失
@@ -719,7 +721,6 @@ def get_dynamic_loss_weights(epoch, args):
             'con_loss_weight': args.con_loss_weight,
             'proj_loss_weight': 0.0,
             'reconstruction_loss_weight': args.reconstruction_loss_weight,
-            'ring_loss_weight': args.ring_loss_weight,
             'ortho_loss_weight': args.ortho_loss_weight
         }
     else:
@@ -733,7 +734,6 @@ def get_dynamic_loss_weights(epoch, args):
             'con_loss_weight': args.con_loss_weight,
             'proj_loss_weight': progress * args.proj_loss_weight,
             'reconstruction_loss_weight': args.reconstruction_loss_weight,
-            'ring_loss_weight': args.ring_loss_weight,
             'ortho_loss_weight': args.ortho_loss_weight
         }
     

@@ -31,8 +31,8 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args):
             concated_input_features = item[0].to(device)
             labels = item[1].to(device)
             
-            # Get model outputs
-            emb, emb_combine, logits, _, _, _, _, _ = model(
+            # Get model outputs (移除了 loss_ring，现在返回 7 个值)
+            emb, emb_combine, logits, _, _, _, _ = model(
                 concated_input_features, None, None, None, False, args
             )
             
@@ -142,24 +142,22 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
         diagnostics: Dictionary of diagnostic metrics
         epoch: Current epoch
         current_lr: Current learning rate
-        losses: Dict with 'bce', 'rec', 'ring', 'ortho' raw losses
+        losses: Dict with 'bce', 'rec', 'ortho' raw losses (ring removed)
         dynamic_weights: Dict with loss weights (including 'ortho_loss_weight')
         ortho_loss_weight: (deprecated) Weight for orthogonal loss, now read from dynamic_weights
     """
     d = diagnostics
     
-    # Line 1: Training status (lr, losses)
+    # Line 1: Training status (lr, losses) - 移除了 Ring 损失
     if current_lr is not None and losses is not None and dynamic_weights is not None:
         w_bce = dynamic_weights.get('bce_loss_weight', 1.0)
         w_rec = dynamic_weights.get('rec_loss_weight', 1.0)
-        w_ring = dynamic_weights.get('ring_loss_weight', 1.0)
         w_ortho = dynamic_weights.get('ortho_loss_weight', 0.1)
         weighted_bce = losses['bce'] * w_bce
         weighted_rec = losses['rec'] * w_rec
-        weighted_ring = losses['ring'] * w_ring
         weighted_ortho = losses.get('ortho', 0.0) * w_ortho
         print(f"[Diag@E{epoch}] lr={current_lr:.2e} | "
-              f"Loss(w): BCE={weighted_bce:.4f}({w_bce:.1f}x), Rec={weighted_rec:.4f}({w_rec:.1f}x), Ring={weighted_ring:.4f}({w_ring:.1f}x), Ortho={weighted_ortho:.4f}({w_ortho:.1f}x)")
+              f"Loss(w): BCE={weighted_bce:.4f}({w_bce:.1f}x), Rec={weighted_rec:.4f}({w_rec:.1f}x), Ortho={weighted_ortho:.4f}({w_ortho:.1f}x)")
     
     # Line 2: Logit & CosSim analysis
     print(f"  Logit: norm={d['norm_logits_mean']:.3f}, abnorm={d['abnorm_logits_mean']:.3f}, margin={d['logit_margin']:.3f}, std={d['logit_std']:.3f} | "
