@@ -241,7 +241,7 @@ def train(args):
             # ==========================================
             # 计算并打印诊断指标
             # ==========================================
-            diagnostics = compute_diagnostics(model, test_data_loader, ano_label, idx_test, device, args)
+            diagnostics = compute_diagnostics(model, test_data_loader, ano_label, idx_test, device, args, normal_for_train_idx=normal_for_train_idx)
             losses = {
                 'bce': batched_bce_loss.item(),
                 'rec': batched_rec_loss.item(),
