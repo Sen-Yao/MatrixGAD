@@ -36,7 +36,7 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
             labels = item[1].to(device)
             
             # Get model outputs without pseudo-anomalies (for test set evaluation)
-            emb, emb_combine, logits, _, _, _, _, _, rec_error = model(
+            emb, emb_combine, logits, _, _, _, _, _, rec_error, _ = model(
                 concated_input_features, None, None, None, False, args
             )
             
@@ -61,7 +61,7 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
                     local_normal_idx = torch.arange(num_pseudo, device=device)
                     
                     # Get model outputs with pseudo-anomaly generation
-                    emb_pseudo, emb_combine_pseudo, logits_pseudo, outlier_emb, _, _, _, _, _ = model(
+                    emb_pseudo, emb_combine_pseudo, logits_pseudo, outlier_emb, _, _, _, _, _, _ = model(
                         concated_input_features, None, None, local_normal_idx, True, args
                     )
                     
@@ -343,8 +343,8 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
         diagnostics: Dictionary of diagnostic metrics
         epoch: Current epoch
         current_lr: Current learning rate
-        losses: Dict with 'bce', 'rec', 'ring', 'ortho' raw losses
-        dynamic_weights: Dict with loss weights (including 'ortho_loss_weight')
+        losses: Dict with 'bce', 'rec', 'ring', 'ortho', 'uniformity' raw losses
+        dynamic_weights: Dict with loss weights (including 'ortho_loss_weight', 'uniformity_loss_weight')
         ortho_loss_weight: (deprecated) Weight for orthogonal loss, now read from dynamic_weights
     """
     d = diagnostics
@@ -355,12 +355,14 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
         w_rec = dynamic_weights.get('rec_loss_weight', 1.0)
         w_ring = dynamic_weights.get('ring_loss_weight', 1.0)
         w_ortho = dynamic_weights.get('ortho_loss_weight', 0.1)
+        w_uni = dynamic_weights.get('uniformity_loss_weight', 0.1)
         weighted_bce = losses['bce'] * w_bce
         weighted_rec = losses['rec'] * w_rec
         weighted_ring = losses['ring'] * w_ring
         weighted_ortho = losses.get('ortho', 0.0) * w_ortho
+        weighted_uni = losses.get('uniformity', 0.0) * w_uni
         print(f"[Diag@E{epoch}] lr={current_lr:.2e} | "
-              f"Loss(w): BCE={weighted_bce:.4f}({w_bce:.1f}x), Rec={weighted_rec:.4f}({w_rec:.1f}x), Ring={weighted_ring:.4f}({w_ring:.1f}x), Ortho={weighted_ortho:.4f}({w_ortho:.1f}x)")
+              f"Loss(w): BCE={weighted_bce:.4f}({w_bce:.1f}x), Rec={weighted_rec:.4f}({w_rec:.1f}x), Ring={weighted_ring:.4f}({w_ring:.1f}x), Ortho={weighted_ortho:.4f}({w_ortho:.1f}x), Uni={weighted_uni:.4f}({w_uni:.1f}x)")
     
     # Line 2: Logit analysis (including pseudo-anomaly/outlier)
     outlier_logit_str = ""

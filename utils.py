@@ -720,7 +720,8 @@ def get_dynamic_loss_weights(epoch, args):
             'proj_loss_weight': 0.0,
             'reconstruction_loss_weight': args.reconstruction_loss_weight,
             'ring_loss_weight': args.ring_loss_weight,
-            'ortho_loss_weight': args.ortho_loss_weight
+            'ortho_loss_weight': args.ortho_loss_weight,
+            'uniformity_loss_weight': args.uniformity_loss_weight
         }
     else:
         # 超过warmup后，使用线性插值平滑地恢复到目标值
@@ -734,7 +735,8 @@ def get_dynamic_loss_weights(epoch, args):
             'proj_loss_weight': progress * args.proj_loss_weight,
             'reconstruction_loss_weight': args.reconstruction_loss_weight,
             'ring_loss_weight': args.ring_loss_weight,
-            'ortho_loss_weight': args.ortho_loss_weight
+            'ortho_loss_weight': args.ortho_loss_weight,
+            'uniformity_loss_weight': args.uniformity_loss_weight
         }
     
 

@@ -234,6 +234,9 @@ class PromptGAD(nn.Module):
             nn.Linear(args.embedding_dim, args.embedding_dim)
         )
 
+        # LayerNorm for new_tokens
+        self.new_tokens_ln = nn.LayerNorm(args.embedding_dim)
+
         # 将模型移动到指定设备
         self.to(self.device)
 
@@ -278,6 +281,9 @@ class PromptGAD(nn.Module):
         # 4. 提取出全新视角的 Token!
         # new_tokens 相当于自适应地提取不同频域视角
         new_tokens = torch.matmul(attn_weights, V)  # [B, M, embedding_dim]
+
+        # 对 new_tokens 应用 LayerNorm
+        new_tokens = self.new_tokens_ln(new_tokens)
 
         # 我们把 attn_weights 一起返回，为了算正交 Loss
         return new_tokens, attn_weights
@@ -383,7 +389,7 @@ class PromptGAD(nn.Module):
 
         # 使用组合后的 tokens 进行编码
         emb = self.TransformerEncoderWithTokens(combined_tokens)
-
+        emb = F.normalize(emb, p=2, dim=-1)
         # 生成全局中心点
         h_mean = torch.mean(emb, dim=1, keepdim=True)
 
@@ -423,6 +429,9 @@ class PromptGAD(nn.Module):
             
             # Project reconstruction error to embedding dimension
             reconstruction_error_proj = self.reconstruction_proj(reconstruction_error[normal_for_generation_idx, :])
+            
+            # 强制将误差向量归一化
+            reconstruction_error_proj = torch.nn.functional.normalize(reconstruction_error_proj, p=2, dim=1)
 
             # Ablation study:
             if args.ablation_random_dir:
@@ -456,6 +465,9 @@ class PromptGAD(nn.Module):
             loss_rec = self.compute_rec_loss(new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx)
 
             emb_combine = torch.cat((emb[:, normal_for_train_idx, :], torch.unsqueeze(outlier_emb, 0)), 1)
+            emb_combine = F.normalize(emb_combine, p=2, dim=-1)
+            # 计算 InfoNCE 均匀性损失，只计算正常节点间的排斥力
+            uniformity_loss = self.compute_infoNCE_uniformity_loss(emb, normal_for_train_idx, args)
 
             f_1 = self.fc1(emb_combine)
         else:
@@ -466,6 +478,7 @@ class PromptGAD(nn.Module):
             # Project reconstruction error to embedding dimension for all nodes
             reconstruction_error_proj = self.reconstruction_proj(reconstruction_error)
             
+           
             f_1 = self.fc1(emb)
         f_1 = self.act(f_1)
         f_2 = self.fc2(f_1)
@@ -473,13 +486,14 @@ class PromptGAD(nn.Module):
         logits = self.fc3(f_2)
         emb = emb.clone()
 
-        # 返回正交损失和重构误差向量
-        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj
+        # 返回正交损失、重构误差向量和均匀性损失
+        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj, uniformity_loss
 
     def compute_rec_loss(self, new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx):
         """
         计算 Token 空间的重构损失
         重构目标是 new_tokens (Prompt Token 提取的频域视角)
+        使用余弦差异损失: 1 - cos(T, \hat T)
         
         Args:
             new_tokens: Prompt Token 提取的新视角 Token [N, M, embedding_dim]
@@ -493,8 +507,17 @@ class PromptGAD(nn.Module):
         # new_tokens: [N, M, embedding_dim] -> flatten: [N, M * embedding_dim]
         target_tokens = new_tokens.view(-1, self.num_prompts * self.args.embedding_dim)
         
-        # Token 空间的重构损失
-        token_rec_loss = self.recon_loss_fn(reconstructed_tokens, target_tokens)
+        # 余弦差异损失: 1 - cos(T, \hat T)
+        # 首先对向量进行 L2 归一化
+        target_norm = F.normalize(target_tokens, p=2, dim=1)
+        reconstructed_norm = F.normalize(reconstructed_tokens, p=2, dim=1)
+        
+        # 计算余弦相似度 (每个样本的点积)
+        cosine_sim = torch.sum(target_norm * reconstructed_norm, dim=1)
+        
+        # 余弦差异损失: 1 - cosine_similarity
+        # 范围: [0, 2]，其中 0 表示完全相同方向，2 表示完全相反方向
+        token_rec_loss = torch.mean(1 - cosine_sim)
         
         return token_rec_loss
 
