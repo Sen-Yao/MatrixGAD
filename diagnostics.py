@@ -21,6 +21,140 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
         
     Returns:
         dict: Dictionary containing diagnostic metrics
+        
+    Diagnostic Metrics (诊断指标说明):
+    ====================================
+    
+    本函数计算以下五大类诊断指标，用于监控模型训练状态和异常检测性能：
+    
+    【Probe 1: Logit Analysis - 对数分析】
+    用于评估模型输出的 logit 分布，判断模型对正常/异常样本的区分能力：
+    
+        - logit_margin: 异常点与正常点 logit 均值之差
+            * 计算方式: abnorm_logits_mean - norm_logits_mean
+            * 含义: 值越大表示模型对正常/异常样本的区分能力越强
+            * 理想状态: 显著为正值（异常点 logit 高于正常点）
+            
+        - logit_std: 所有样本 logit 的标准差
+            * 含义: 衡量模型输出的分散程度
+            * 理想状态: 适中，过低表示输出坍塌，过高可能不稳定
+            
+        - norm_logits_mean: 正常样本 logit 均值
+            * 含义: 正常样本的异常得分均值
+            * 理想状态: 较低（接近 0 或负值）
+            
+        - abnorm_logits_mean: 异常样本 logit 均值
+            * 含义: 异常样本的异常得分均值
+            * 理想状态: 较高（正值，明显高于 norm_logits_mean）
+            
+        - outlier_logits_mean: 伪异常样本 logit 均值
+            * 含义: 通过数据增强生成的伪异常样本的异常得分均值
+            * 用途: 验证伪异常生成是否有效（应接近真异常）
+            
+        - outlier_logits_std: 伪异常样本 logit 标准差
+            * 含义: 伪异常样本 logit 的分散程度
+            
+        - outlier_logits_max/min: 伪异常样本 logit 的最大/最小值
+            * 用途: 检测伪异常样本中的极端值
+    
+    【Probe 2: Embedding Collapse - 嵌入坍塌检测】
+    用于检测特征空间是否出现坍塌（所有样本映射到相似位置）：
+    
+        - avg_cos_sim: 正常样本嵌入之间的平均余弦相似度
+            * 计算方式: 对正常样本嵌入两两计算余弦相似度后取平均（排除自身）
+            * 含义: 值过高（接近 1）表示嵌入坍塌，所有正常样本映射到几乎相同的位置
+            * 理想状态: 中等偏低（0.3-0.7），表示特征多样性
+            
+        - cos_sim_std: 余弦相似度的标准差
+            * 含义: 衡量样本间相似度的一致性
+            * 理想状态: 较低，表示样本关系相对稳定
+    
+    【Probe 3: Euclidean Separation - 欧氏距离分离度】
+    用于评估正常类和异常类在嵌入空间中的分离程度：
+    
+        - center_dist: 正常中心与异常中心之间的欧氏距离
+            * 计算方式: ||norm_center - abnorm_center||_2
+            * 含义: 值越大表示两类中心分离越好
+            * 理想状态: 较大
+            
+        - norm_intra_dist: 正常类内聚度
+            * 计算方式: 正常样本到正常中心的平均欧氏距离
+            * 含义: 值越小表示正常类越紧凑
+            * 理想状态: 较小
+            
+        - abnorm_intra_dist: 异常类内聚度
+            * 计算方式: 异常样本到异常中心的平均欧氏距离
+            * 含义: 值越小表示异常类越紧凑（但异常样本本身可能多样）
+            
+        - separation_ratio: 分离比率
+            * 计算方式: center_dist / norm_intra_dist
+            * 含义: 类间距离与类内距离的比值
+            * 理想状态: 较大（>1），表示类间分离大于类内散布
+    
+    【Probe 4: Triangular Geometry - 三角几何关系】
+    用于分析伪异常样本在嵌入空间中与正常/真异常样本的几何关系：
+    
+        - dist_norm_outlier (N→O): 正常中心到伪异常中心的距离
+            * 含义: 衡量伪异常样本偏离正常样本的程度
+            
+        - dist_norm_abnorm (N→A): 正常中心到真异常中心的距离
+            * 含义: 衡量真异常样本偏离正常样本的程度
+            
+        - dist_outlier_abnorm (O→A): 伪异常中心到真异常中心的距离
+            * 含义: 衡量伪异常与真异常的接近程度
+            
+        - outlier_intra_dist: 伪异常类内聚度
+            * 含义: 伪异常样本到伪异常中心的平均距离
+            
+        - cos_sim_directions: 方向余弦相似度
+            * 计算方式: cos_sim(N→O方向, N→A方向)
+            * 含义: 衡量"正常→伪异常"与"正常→真异常"两个方向的一致性
+            * 理想状态: 接近 1，表示伪异常生成方向与真异常方向一致
+            
+        - angle_degrees: 方向夹角（度）
+            * 计算方式: arccos(cos_sim_directions) * 180/π
+            * 含义: 两个方向之间的夹角
+            * 理想状态: 接近 0°，表示方向一致
+            
+        - outlier_separation_ratio: 伪异常分离比率
+            * 计算方式: dist_norm_outlier / norm_intra_dist
+            * 含义: 伪异常偏离正常的相对程度
+            
+        - outlier_closer_to_abnorm: 伪异常是否更接近真异常
+            * 含义: 若 O→A < N→O，则伪异常位于真异常侧
+            * 理想状态: True，表示伪异常能有效模拟真异常
+    
+    【Probe 5: Reconstruction Error Vector Magnitude - 重构误差向量模长】
+    用于分析重构误差向量 R_i 的模长分布，检测模型重构能力：
+    
+    正常点模长统计（前缀 norm_rec_mag_）：
+        - mean: 正常样本重构误差模长均值
+        - std: 正常样本重构误差模长标准差
+        - min/max: 最小/最大值
+        - median: 中位数
+        - q25/q75: 25%/75% 分位数
+    
+    异常点模长统计（前缀 abnorm_rec_mag_）：
+        - mean: 异常样本重构误差模长均值
+        - std: 异常样本重构误差模长标准差
+        - min/max: 最小/最大值
+        - median: 中位数
+        - q25/q75: 25%/75% 分位数
+    
+    差异指标：
+        - rec_mag_diff: 异常点与正常点模长均值之差
+            * 计算方式: abnorm_rec_mag_mean - norm_rec_mag_mean
+            * 含义: 正值表示异常样本重构误差更大
+            * 理想状态: 显著为正
+            
+        - rec_mag_ratio: 异常点与正常点模长均值比率
+            * 计算方式: abnorm_rec_mag_mean / norm_rec_mag_mean
+            * 理想状态: >1，表示异常样本更难重构
+    
+    【Sample Statistics - 样本统计】
+        - num_normal: 测试集中正常样本数量
+        - num_abnormal: 测试集中异常样本数量
+        - num_outlier: 生成的伪异常样本数量
     """
     model.eval()
     
