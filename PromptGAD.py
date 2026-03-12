@@ -421,6 +421,10 @@ class PromptGAD(nn.Module):
         emb_combine = None
         noised_normal_for_generation_emb = None
         reconstruction_error_proj = None  # 重构误差向量 R_i
+        
+        # 初始化用于诊断的 token 存储
+        original_new_tokens = None  # 原始 tokenizer 输出的 tokens
+        reconstructed_tokens = None  # 重构后的 tokens
 
         gna_loss = torch.tensor(0.0, device=emb.device)
         proj_loss = torch.tensor(0.0, device=emb.device)
@@ -428,6 +432,12 @@ class PromptGAD(nn.Module):
         loss_ring = torch.tensor(0.0, device=emb.device)
         con_loss = torch.tensor(0.0, device=emb.device)
         loss_rec = torch.tensor(0.0, device=emb.device)
+        
+        # 在训练或非训练模式下都计算重构 tokens（用于诊断）
+        # reconstructed_tokens: [num_nodes, M * embedding_dim]
+        reconstructed_tokens = self.token_decoder(emb).squeeze(0)
+        original_new_tokens = new_tokens  # 保存原始的 new_tokens
+        
         if train_flag:
             # start_time = time.time()
             # 高效重排
@@ -510,8 +520,8 @@ class PromptGAD(nn.Module):
         logits = self.fc3(f_2)
         emb = emb.clone()
 
-        # 返回正交损失、重构误差向量和均匀性损失
-        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj, uniformity_loss
+        # 返回正交损失、重构误差向量、均匀性损失以及用于诊断的原始和重构 tokens
+        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj, uniformity_loss, original_new_tokens, reconstructed_tokens
 
     def compute_rec_loss(self, new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx):
         """

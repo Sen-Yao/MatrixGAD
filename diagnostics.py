@@ -163,6 +163,8 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     all_outlier_logits = []
     all_outlier_embs = []
     all_reconstruction_errors = []  # Store reconstruction error vectors
+    all_original_tokens = []  # Store original new_tokens from tokenizer
+    all_reconstructed_tokens = []  # Store reconstructed tokens from decoder
     
     with torch.no_grad():
         for item in data_loader:
@@ -170,7 +172,7 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
             labels = item[1].to(device)
             
             # Get model outputs without pseudo-anomalies (for test set evaluation)
-            emb, emb_combine, logits, _, _, _, _, _, rec_error, _ = model(
+            emb, emb_combine, logits, _, _, _, _, _, rec_error, _, original_tokens, reconstructed_tokens = model(
                 concated_input_features, None, None, None, False, args
             )
             
@@ -180,6 +182,12 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
             # Store reconstruction error vectors if available
             if rec_error is not None:
                 all_reconstruction_errors.append(rec_error.cpu())
+            
+            # Store tokens for L2 norm comparison
+            if original_tokens is not None:
+                all_original_tokens.append(original_tokens.cpu())
+            if reconstructed_tokens is not None:
+                all_reconstructed_tokens.append(reconstructed_tokens.cpu())
             
             # Get pseudo-anomaly logits if normal_for_train_idx is provided
             if normal_for_train_idx is not None:
@@ -195,7 +203,7 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
                     local_normal_idx = torch.arange(num_pseudo, device=device)
                     
                     # Get model outputs with pseudo-anomaly generation
-                    emb_pseudo, emb_combine_pseudo, logits_pseudo, outlier_emb, _, _, _, _, _, _ = model(
+                    emb_pseudo, emb_combine_pseudo, logits_pseudo, outlier_emb, _, _, _, _, _, _, _, _ = model(
                         concated_input_features, None, None, local_normal_idx, True, args
                     )
                     
@@ -228,7 +236,7 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
         outlier_embs = None
     
     # ==========================================
-    # Diagnostic Probes
+    # Diagnostic Probes Setup
     # ==========================================
     
     # Split test set into "true normal" vs "true abnormal"
@@ -246,6 +254,15 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     abnorm_embs = embs_tensor[abnorm_mask]
     
     diagnostics = {}
+    
+    # Concatenate tokens for L2 norm comparison
+    concatenated_original_tokens = None
+    concatenated_reconstructed_tokens = None
+    
+    if len(all_original_tokens) > 0:
+        concatenated_original_tokens = torch.cat(all_original_tokens, dim=0)
+    if len(all_reconstructed_tokens) > 0:
+        concatenated_reconstructed_tokens = torch.cat(all_reconstructed_tokens, dim=0)
     
     # ==========================================
     # Probe 1: Logit Analysis (including pseudo-anomaly)
@@ -460,6 +477,105 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
         diagnostics['abnorm_rec_magnitudes'] = None
     
     # ==========================================
+    # Probe 6: Token L2 Norm Comparison (新增)
+    # 用于比较原始 token 和重构 token 的 L2 范数
+    # ==========================================
+    if concatenated_original_tokens is not None and concatenated_reconstructed_tokens is not None:
+        # 将 original_tokens 展平为 [N, M * embedding_dim] 以匹配 reconstructed_tokens
+        num_nodes = concatenated_original_tokens.size(0)
+        num_prompts = concatenated_original_tokens.size(1)
+        embedding_dim = concatenated_original_tokens.size(2)
+        
+        original_tokens_flat = concatenated_original_tokens.view(num_nodes, num_prompts * embedding_dim)
+        
+        # 计算每个样本原始 token 的 L2 范数
+        original_token_norms = torch.norm(original_tokens_flat, p=2, dim=1)
+        
+        # 计算每个样本重构 token 的 L2 范数
+        reconstructed_token_norms = torch.norm(concatenated_reconstructed_tokens, p=2, dim=1)
+        
+        # 计算每个样本原始 token 和重构 token 之间的 L2 距离
+        token_diff_norms = torch.norm(original_tokens_flat - concatenated_reconstructed_tokens, p=2, dim=1)
+        
+        # 分别计算正常点和异常点的统计
+        norm_original_norms = original_token_norms[norm_mask]
+        abnorm_original_norms = original_token_norms[abnorm_mask]
+        norm_reconstructed_norms = reconstructed_token_norms[norm_mask]
+        abnorm_reconstructed_norms = reconstructed_token_norms[abnorm_mask]
+        norm_diff_norms = token_diff_norms[norm_mask]
+        abnorm_diff_norms = token_diff_norms[abnorm_mask]
+        
+        # 原始 token 范数统计
+        if len(norm_original_norms) > 0:
+            diagnostics['token_orig_norm_mean'] = norm_original_norms.mean().item()
+            diagnostics['token_orig_norm_std'] = norm_original_norms.std().item()
+            diagnostics['token_orig_norm_min'] = norm_original_norms.min().item()
+            diagnostics['token_orig_norm_max'] = norm_original_norms.max().item()
+        else:
+            diagnostics['token_orig_norm_mean'] = float('nan')
+            diagnostics['token_orig_norm_std'] = float('nan')
+            diagnostics['token_orig_norm_min'] = float('nan')
+            diagnostics['token_orig_norm_max'] = float('nan')
+        
+        # 重构 token 范数统计
+        if len(norm_reconstructed_norms) > 0:
+            diagnostics['token_rec_norm_mean'] = norm_reconstructed_norms.mean().item()
+            diagnostics['token_rec_norm_std'] = norm_reconstructed_norms.std().item()
+            diagnostics['token_rec_norm_min'] = norm_reconstructed_norms.min().item()
+            diagnostics['token_rec_norm_max'] = norm_reconstructed_norms.max().item()
+        else:
+            diagnostics['token_rec_norm_mean'] = float('nan')
+            diagnostics['token_rec_norm_std'] = float('nan')
+            diagnostics['token_rec_norm_min'] = float('nan')
+            diagnostics['token_rec_norm_max'] = float('nan')
+        
+        # 差异范数统计（原始 vs 重构）
+        if len(norm_diff_norms) > 0:
+            diagnostics['token_diff_norm_mean'] = norm_diff_norms.mean().item()
+            diagnostics['token_diff_norm_std'] = norm_diff_norms.std().item()
+            diagnostics['token_diff_norm_min'] = norm_diff_norms.min().item()
+            diagnostics['token_diff_norm_max'] = norm_diff_norms.max().item()
+            if len(abnorm_diff_norms) > 0:
+                diagnostics['token_diff_norm_abnorm_mean'] = abnorm_diff_norms.mean().item()
+                diagnostics['token_diff_norm_abnorm_std'] = abnorm_diff_norms.std().item()
+            else:
+                diagnostics['token_diff_norm_abnorm_mean'] = float('nan')
+                diagnostics['token_diff_norm_abnorm_std'] = float('nan')
+        else:
+            diagnostics['token_diff_norm_mean'] = float('nan')
+            diagnostics['token_diff_norm_std'] = float('nan')
+            diagnostics['token_diff_norm_min'] = float('nan')
+            diagnostics['token_diff_norm_max'] = float('nan')
+            diagnostics['token_diff_norm_abnorm_mean'] = float('nan')
+            diagnostics['token_diff_norm_abnorm_std'] = float('nan')
+        
+        # 范数比率统计（重构 / 原始）
+        if len(norm_original_norms) > 0 and len(norm_reconstructed_norms) > 0:
+            norm_ratio = norm_reconstructed_norms / (norm_original_norms + 1e-8)
+            diagnostics['token_norm_ratio_mean'] = norm_ratio.mean().item()
+            diagnostics['token_norm_ratio_std'] = norm_ratio.std().item()
+        else:
+            diagnostics['token_norm_ratio_mean'] = float('nan')
+            diagnostics['token_norm_ratio_std'] = float('nan')
+    else:
+        diagnostics['token_orig_norm_mean'] = float('nan')
+        diagnostics['token_orig_norm_std'] = float('nan')
+        diagnostics['token_orig_norm_min'] = float('nan')
+        diagnostics['token_orig_norm_max'] = float('nan')
+        diagnostics['token_rec_norm_mean'] = float('nan')
+        diagnostics['token_rec_norm_std'] = float('nan')
+        diagnostics['token_rec_norm_min'] = float('nan')
+        diagnostics['token_rec_norm_max'] = float('nan')
+        diagnostics['token_diff_norm_mean'] = float('nan')
+        diagnostics['token_diff_norm_std'] = float('nan')
+        diagnostics['token_diff_norm_min'] = float('nan')
+        diagnostics['token_diff_norm_max'] = float('nan')
+        diagnostics['token_diff_norm_abnorm_mean'] = float('nan')
+        diagnostics['token_diff_norm_abnorm_std'] = float('nan')
+        diagnostics['token_norm_ratio_mean'] = float('nan')
+        diagnostics['token_norm_ratio_std'] = float('nan')
+    
+    # ==========================================
     # Sample Statistics
     # ==========================================
     diagnostics['num_normal'] = norm_embs.size(0) if norm_embs.size(0) > 0 else 0
@@ -585,3 +701,19 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
                   f"median={d['abnorm_rec_mag_median']:.4f}, [{d['abnorm_rec_mag_q25']:.4f}, {d['abnorm_rec_mag_q75']:.4f}], "
                   f"min={d['abnorm_rec_mag_min']:.4f}, max={d['abnorm_rec_mag_max']:.4f}")
             print(f"    差异: diff={d['rec_mag_diff']:.4f}, ratio={d['rec_mag_ratio']:.4f}x")
+    
+    # Line 7: Token L2 Norm Comparison (新增)
+    if not np.isnan(d.get('token_orig_norm_mean', float('nan'))):
+        print(f"  TokenNorm: Token 重构质量比较:")
+        print(f"    原始 Token (Tokenizer 输出): mean={d['token_orig_norm_mean']:.4f}(±{d['token_orig_norm_std']:.4f}), "
+              f"min={d['token_orig_norm_min']:.4f}, max={d['token_orig_norm_max']:.4f}")
+        if not np.isnan(d.get('token_rec_norm_mean', float('nan'))):
+            print(f"    重构 Token (Decoder 输出): mean={d['token_rec_norm_mean']:.4f}(±{d['token_rec_norm_std']:.4f}), "
+                  f"min={d['token_rec_norm_min']:.4f}, max={d['token_rec_norm_max']:.4f}")
+        if not np.isnan(d.get('token_diff_norm_mean', float('nan'))):
+            print(f"    重构误差 (原始 vs 重构): mean={d['token_diff_norm_mean']:.4f}(±{d['token_diff_norm_std']:.4f}), "
+                  f"min={d['token_diff_norm_min']:.4f}, max={d['token_diff_norm_max']:.4f}")
+            if not np.isnan(d.get('token_diff_norm_abnorm_mean', float('nan'))):
+                print(f"    异常点重构误差: mean={d['token_diff_norm_abnorm_mean']:.4f}(±{d['token_diff_norm_abnorm_std']:.4f})")
+        if not np.isnan(d.get('token_norm_ratio_mean', float('nan'))):
+            print(f"    范数比率 (重构/原始): mean={d['token_norm_ratio_mean']:.4f}(±{d['token_norm_ratio_std']:.4f})")
