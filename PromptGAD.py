@@ -368,6 +368,35 @@ class PromptGAD(nn.Module):
 
         return emb
 
+    def TransformerEncoderWithNewTokens(self, tokens):
+        """
+        处理只有 new_tokens 的情况（不包含原始 tokens）
+
+        Inputs:
+            - tokens: 已经投影过的 new_tokens 序列，形状 [batch_size, M, embedding_dim]
+        Outputs:
+            - emb: 输入节点的编码结果，形状 [1, batch_size, embedding_dim]
+        """
+        for i, l in enumerate(self.layers):
+            tokens, current_attention_weights = self.layers[i](tokens)
+            if i == len(self.layers) - 1:  # 拿到最后一层的注意力
+                attention_weights = current_attention_weights
+                # 聚合多头注意力
+                agg_attention_weights = torch.mean(attention_weights, dim=1)
+                # agg_attention_weights: [N, M, M]
+        emb = self.final_ln(tokens)
+
+        # 由于只有 M 个 new_tokens，没有特定的 0-hop 位置
+        # 我们对所有位置的注意力进行平均池化，得到统一的注意力分数
+        # attention_scores: [N, M]，对每一行进行平均
+        attention_scores = torch.mean(agg_attention_weights, dim=1)
+
+        # 基于 attention_scores 进行池化，得到最终编码结果
+        # emb: [1, N, embedding_dim]
+        emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
+
+        return emb
+
     def forward(self, input_tokens, adj, _, normal_for_train_idx, train_flag, args, sparse=False):
 
         # input_tokens: (N, args.pp_k+1, d)
@@ -380,15 +409,10 @@ class PromptGAD(nn.Module):
         # 计算正交损失
         ortho_loss = self.compute_filter_orthogonal_loss(prompt_attn_weights)
 
-        # 将新视角 Token 与原始 Token 结合
-        # 原始 tokens 投影后: [N, pp_k+1, embedding_dim]
+        # 只使用新视角 Token 进行编码
         # 新视角 tokens: [N, M, embedding_dim]
-        # 拼接: [N, pp_k+1 + M, embedding_dim]
-        projected_original = self.token_projection(input_tokens)
-        combined_tokens = torch.cat([projected_original, new_tokens], dim=1)
-
-        # 使用组合后的 tokens 进行编码
-        emb = self.TransformerEncoderWithTokens(combined_tokens)
+        # 直接使用 new_tokens 进行编码，不需要拼接旧 tokens
+        emb = self.TransformerEncoderWithNewTokens(new_tokens)
         emb = F.normalize(emb, p=2, dim=-1)
         # 生成全局中心点
         h_mean = torch.mean(emb, dim=1, keepdim=True)
