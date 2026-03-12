@@ -180,7 +180,7 @@ def train(args):
             loss_bce = b_xent(logits, lbl)
             loss_bce = torch.mean(loss_bce)
 
-            diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
+            # diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
             # loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
 
             # 添加正交损失和均匀性损失到总损失（使用动态权重）

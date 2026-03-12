@@ -475,58 +475,77 @@ class PromptGAD(nn.Module):
             # print(f"time for shuffle:{time.time() - start_time}")
             normal_for_generation_idx = normal_for_train_idx[: int(len(normal_for_train_idx) * args.sample_rate)]            
             normal_for_generation_emb = emb[:, normal_for_generation_idx, :]
-            # print(f"time for normal_for_generation_emb:{time.time() - start_time}")
-            # Noise
-            noise = torch.randn(normal_for_generation_emb.size(), device=self.device) * args.var + args.mean
-            noised_normal_for_generation_emb = normal_for_generation_emb + noise
-            # print(f"time for noise:{time.time() - start_time}")
 
-            # 重构学习：重构目标是 new_tokens (Prompt Token 提取的频域视角)
-            # reconstructed_tokens: [num_nodes, M * n_in]
-            reconstructed_tokens = self.token_decoder(emb).squeeze(0)
-            
-            # 计算重构误差，目标是 new_tokens
-            # new_tokens: [N, M, n_in] -> flatten: [N, M * n_in]
-            target_tokens = new_tokens.view(-1, self.num_prompts * self.n_in)
-            reconstruction_error = reconstructed_tokens - target_tokens
-            
-            # Project reconstruction error to n_in dimension
-            reconstruction_error_proj = self.reconstruction_proj(reconstruction_error[normal_for_generation_idx, :])
-            
-            # 强制将误差向量归一化
-            reconstruction_error_proj = torch.nn.functional.normalize(reconstruction_error_proj, p=2, dim=1)
+            # ==================== 新的伪异常生成逻辑 ====================
+            # 对每个正常节点，从原始输入 token 序列（在Prompt提取tokenizer前）随机选一个token，
+            # 替换成当前批次内其他随机正常节点的对应Token
+            # 正常前向：混洗后的Token序列正常过Prompt提取→Transformer编码→CLS输出，作为伪异常样本
 
-            # Ablation study:
-            if args.ablation_random_dir:
-                # 计算原始扰动向量的模长 (Magnitude)
-                # dim=1 表示计算每个样本向量的范数，keepdim=True 保持形状为 (Batch, 1) 以便广播
-                norms = torch.norm(reconstruction_error_proj, p=2, dim=1, keepdim=True)
+            # 获取当前批次用于生成异常的正常节点的原始token序列
+            batch_normal_tokens = input_tokens[normal_for_generation_idx, :, :]  # [num_normal_gen, num_hops+1, d]
+            
+            # 创建混洗后的token序列
+            shuffled_tokens = batch_normal_tokens.clone()
+            
+            # 随机选择token位置进行替换
+            num_nodes, num_hops_plus1, d_model = shuffled_tokens.shape
+            if num_nodes > 1:  # 确保至少有两个节点可以混洗
+                # 随机选择一个hop位置
+                hop_idx = torch.randint(0, num_hops_plus1, (1,)).item()
                 
-                # 生成同维度的随机向量 (Random Direction)
-                # 从标准正态分布采样
-                random_vec = torch.randn_like(reconstruction_error_proj)
+                # 对每个节点，随机选择另一个节点的对应hop token进行替换
+                for i in range(num_nodes):
+                    # 选择一个不同于当前节点的随机节点
+                    other_nodes = list(range(num_nodes))
+                    other_nodes.remove(i)
+                    if len(other_nodes) > 0:
+                        random_node_idx = random.choice(other_nodes)
+                        # 替换指定hop位置的token
+                        shuffled_tokens[i, hop_idx, :] = batch_normal_tokens[random_node_idx, hop_idx, :]
                 
-                # 将随机向量归一化为单位向量 (Unit Vector)
-                random_dir = torch.nn.functional.normalize(random_vec, p=2, dim=1)
+                # 对混洗后的token序列进行正常的Prompt提取→Transformer编码→CLS输出
+                # 使用混洗后的tokens进行tokenizer
+                # 注意：确保梯度可以正常回传，不冻结任何参数
+                shuffled_new_tokens, shuffled_prompt_attn_weights = self.tokenizer(shuffled_tokens)
                 
-                # 赋予随机方向以原始模长
-                reconstruction_error_proj = norms * random_dir
+                # 使用CLS token处理混洗后的new_tokens
+                # 确保梯度正常回传
+                shuffled_emb = self.TransformerEncoderWithCLS(shuffled_new_tokens)
+                shuffled_emb = F.normalize(shuffled_emb, p=2, dim=-1)
+                
+                # 将混洗后的嵌入作为伪异常样本
+                outlier_emb = shuffled_emb.squeeze(0)  # [num_normal_gen, n_in]
+            else:
+                # 如果节点数不够混洗，创建一个零张量作为伪异常样本（或采用其他策略）
+                # 这种情况下，我们仍然需要一个outlier_emb，即使它不包含真实的混洗信息
+                # 但需要注意这可能导致logits为0，所以我们要确保使用正常流程生成pseudo异常
+                # 如果没有足够的节点进行混洗，我们可以复制现有节点并稍作修改来创建伪异常
+                if len(normal_for_generation_idx) > 0:
+                    # 使用第一个节点的token作为基础，稍微扰动来创建伪异常
+                    base_tokens = batch_normal_tokens[0:1, :, :].expand(num_nodes, -1, -1).clone()
+                    # 添加轻微噪声以创建差异
+                    noise = torch.randn_like(base_tokens) * 0.01
+                    base_tokens = base_tokens + noise
+                    
+                    # 对扰动后的tokens进行正常的Prompt提取→Transformer编码→CLS输出
+                    shuffled_new_tokens, shuffled_prompt_attn_weights = self.tokenizer(base_tokens)
+                    
+                    # 使用CLS token处理扰动后的new_tokens
+                    shuffled_emb = self.TransformerEncoderWithCLS(shuffled_new_tokens)
+                    shuffled_emb = F.normalize(shuffled_emb, p=2, dim=-1)
+                    
+                    # 将扰动后的嵌入作为伪异常样本
+                    outlier_emb = shuffled_emb.squeeze(0)  # [num_normal_gen, n_in]
+                else:
+                    # 如果没有用于生成异常的节点，创建零张量
+                    outlier_emb = torch.zeros((len(normal_for_generation_idx), self.n_in), device=emb.device, dtype=emb.dtype)
 
-            outlier_emb = normal_for_generation_emb + args.outlier_beta * reconstruction_error_proj
-            outlier_emb = outlier_emb.squeeze(0)
+            # ===========================================================
 
-            # 中心点对齐损失，鼓励离群点距离全局中心的距离保持在一个 ring 内
-            # 计算离群点嵌入与全局中心的距离
-            outlier_to_center_dist = torch.norm(outlier_emb - h_mean.squeeze(0), p=2, dim=1)
-            # 只有超过 confidence_margin 的距离才会产生损失
-            ring_out_range_loss = torch.relu(args.ring_R_min - outlier_to_center_dist)
-            ring_in_range_loss = torch.relu(outlier_to_center_dist - args.ring_R_max)
-
-            loss_ring = torch.mean(ring_out_range_loss + ring_in_range_loss)
-            
-            # 计算重构损失：目标是重构 new_tokens
+            # 计算重构损失：目标是 new_tokens
             loss_rec = self.compute_rec_loss(new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx)
 
+            # 使用原始正常节点嵌入和生成的伪异常嵌入进行对比学习
             emb_combine = torch.cat((emb[:, normal_for_train_idx, :], torch.unsqueeze(outlier_emb, 0)), 1)
             emb_combine = F.normalize(emb_combine, p=2, dim=-1)
             # 计算 InfoNCE 均匀性损失，只计算正常节点间的排斥力

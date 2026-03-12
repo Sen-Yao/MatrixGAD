@@ -120,33 +120,20 @@ $$
 
 where $\text{target_tokens}$ are the flattened original frequency-domain tokens.
 
-### 4.2 Reconstruction Error as Anomaly Direction
+### 4.2 New Pseudo-Anomaly Generation via Token Shuffling
 
-The reconstruction error is projected to the same token space:
+Instead of using reconstruction errors, we now generate pseudo-anomalies using a token shuffling approach:
 
-$$
-\mathbf{R} = \text{MLP}_{\text{proj}}(\hat{\text{tokens}} - \text{target_tokens})
-$$
+For each normal node, we randomly select a token from the original input token sequence (before the Prompt tokenizer extraction) and replace it with the corresponding token from another randomly selected normal node in the current batch. The process is as follows:
 
-$$
-\mathbf{R} = \text{normalize}(\mathbf{R})
-$$
+1. For each normal node in the batch, select a random hop position in the token sequence
+2. Replace the token at this position with the corresponding token from another randomly chosen normal node in the same batch
+3. Process the shuffled token sequence through the normal forward pass: shuffled tokens → Prompt extraction → Transformer encoding → CLS output, generating pseudo-anomaly samples
+4. Compute the binary cross-entropy loss between normal node representations and the generated pseudo-anomaly representations
 
-### 4.3 Synthetic Outlier Generation
+Special handling is applied when there are insufficient nodes for shuffling (less than 2 nodes in the batch): in such cases, slight noise is added to the tokens of existing nodes to create pseudo-anomalies.
 
-For a subset of normal nodes (15% of training normal nodes), we generate synthetic outliers:
-
-1. Add Gaussian noise to normal embeddings:
-   $$
-   \tilde{\mathbf{E}}_n = \mathbf{E}_n + \mathcal{N}(\mu, \sigma^2)
-   $$
-   where $\mu=0.02$, $\sigma=0.01$ for Reddit and Photo datasets, $\mu=0$, $\sigma=0$ otherwise.
-
-2. Generate outliers using the projected reconstruction error:
-   $$
-   \mathbf{E}_{\text{out}} = \mathbf{E}_n + \beta \cdot \mathbf{R}
-   $$
-   where $\beta$ is the outlier magnitude coefficient (we use $\beta \in \{0.2, 0.3, 0.5\}$).
+This approach creates meaningful yet artificial anomalies by mixing tokens from different normal nodes, which helps the model better distinguish between normal and truly anomalous patterns. The gradients flow back through the entire pipeline, ensuring that the Prompt tokens and Transformer parameters learn to differentiate between normal and pseudo-anomalous patterns effectively.
 
 ## 5 Training Objective
 
