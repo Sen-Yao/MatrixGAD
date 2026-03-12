@@ -89,7 +89,6 @@ def train(args):
 
         # Initialize model and optimiser
         concated_input_features = nagphormer_tokenization(features.squeeze(0), adj.squeeze(0), args)
-        print("check_token_collapse!:", check_token_collapse(concated_input_features))
         model = PromptGAD(ft_size, args.embedding_dim, 'prelu', args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay)
@@ -147,9 +146,6 @@ def train(args):
 
 
     # Train model
-    # 在训练开始前，打印前几个节点的前几个token的余弦相似度矩阵
-    print_token_cosine_similarity_matrix(concated_input_features, num_nodes=3, num_tokens=min(4, concated_input_features.shape[1]))
-    
     print(f"Start training! Total epochs: {args.num_epoch}")
     pbar = tqdm(total=args.num_epoch, desc='Training')
     total_time = 0
