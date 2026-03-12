@@ -223,6 +223,31 @@ def train(args):
                         "learning_rate": current_lr}, step=epoch)
         lr_scheduler.step()
         if epoch % 10 == 0:
+            # ==========================================
+            # 先基于当前train状态获取诊断数据并打印
+            # ==========================================
+            # 创建一个临时数据加载器用于获取train状态下的诊断数据
+            # 使用训练数据，但不进行参数更新
+            model.train()  # 保持train模式
+            train_flag = True
+            
+            # 使用完整的训练数据来获取诊断信息
+            diagnostics_train_loader = Data.DataLoader(batch_data_train, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=False)
+            
+            # 计算并打印基于train状态的诊断指标
+            diagnostics = compute_diagnostics(model, diagnostics_train_loader, ano_label, all_idx, device, args, normal_for_train_idx=normal_for_train_idx)
+            losses = {
+                'bce': batched_bce_loss.item(),
+                'rec': batched_rec_loss.item(),
+                'ring': batched_ring_loss.item(),
+                'ortho': batched_ortho_loss.item(),
+                'uniformity': batched_uniformity_loss.item()
+            }
+            print_diagnostics(diagnostics, epoch, current_lr=current_lr, losses=losses, dynamic_weights=dynamic_weights, ortho_loss_weight=args.ortho_loss_weight)
+            
+            # ==========================================
+            # 然后进行eval和后续操作（eval时不再输出诊断）
+            # ==========================================
             model.eval()
             train_flag = False
 
@@ -240,19 +265,6 @@ def train(args):
                 auc = roc_auc_score(ano_label[idx_test], logits)
                 ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
             wandb.log({"AUC": auc, "AP": ap}, step=epoch)
-            
-            # ==========================================
-            # 计算并打印诊断指标
-            # ==========================================
-            diagnostics = compute_diagnostics(model, test_data_loader, ano_label, idx_test, device, args, normal_for_train_idx=normal_for_train_idx)
-            losses = {
-                'bce': batched_bce_loss.item(),
-                'rec': batched_rec_loss.item(),
-                'ring': batched_ring_loss.item(),
-                'ortho': batched_ortho_loss.item(),
-                'uniformity': batched_uniformity_loss.item()
-            }
-            print_diagnostics(diagnostics, epoch, current_lr=current_lr, losses=losses, dynamic_weights=dynamic_weights, ortho_loss_weight=args.ortho_loss_weight)
             
             # 检查是否为最佳模型
             if auc > best_AUC and ap > best_AP:
