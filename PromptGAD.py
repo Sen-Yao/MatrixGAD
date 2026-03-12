@@ -187,55 +187,57 @@ class PromptGAD(nn.Module):
         # 设置批次大小
         self.batchsize = getattr(args, 'batchsize', None)
         
-        self.gcn1 = GCN(args.embedding_dim, args.embedding_dim, activation)
-        self.gcn2 = GCN(args.embedding_dim, args.embedding_dim, activation)
+        self.gcn1 = GCN(n_in, n_in, activation)
+        self.gcn2 = GCN(n_in, n_in, activation)
 
-        self.fc1 = nn.Linear(n_h, int(n_h / 2), bias=False)
-        self.fc2 = nn.Linear(int(n_h / 2), int(n_h / 4), bias=False)
-        self.fc3 = nn.Linear(int(n_h / 4), 1, bias=False)
-        self.fc4 = nn.Linear(n_h, n_h, bias=False)
+        # 使用 n_in 替代 n_h 作为线性层的输入维度
+        self.fc1 = nn.Linear(n_in, int(n_in / 2), bias=False)
+        self.fc2 = nn.Linear(int(n_in / 2), int(n_in / 4), bias=False)
+        self.fc3 = nn.Linear(int(n_in / 4), 1, bias=False)
+        self.fc4 = nn.Linear(n_in, n_in, bias=False)
         self.act = nn.ReLU()
 
         self.n_in = n_in
 
         # Graph Transformer
-        encoders = [EncoderLayer(args.embedding_dim, args.GT_ffn_dim, args.GT_dropout, args.GT_attention_dropout, args.GT_num_heads)
+        encoders = [EncoderLayer(self.n_in, args.GT_ffn_dim, args.GT_dropout, args.GT_attention_dropout, args.GT_num_heads)
                     for _ in range(args.GT_num_layers)]
         self.layers = nn.ModuleList(encoders)
-        self.final_ln = nn.LayerNorm(args.embedding_dim)
-        self.read_out = nn.Linear(args.embedding_dim, args.embedding_dim)
-
-        self.token_projection = nn.Linear(self.n_in, args.embedding_dim)
+        self.final_ln = nn.LayerNorm(self.n_in)
+        self.read_out = nn.Linear(self.n_in, self.n_in)
 
         # 可学习的离散 Prompt Token (频域视角)
-        # M 个 prompt，每个维度为 embedding_dim
+        # M 个 prompt，每个维度为 n_in (保持与输入token相同的维度)
         self.num_prompts = getattr(args, 'num_prompts', 8)
-        self.prompts = nn.Parameter(torch.randn(1, self.num_prompts, args.embedding_dim))
+        self.prompts = nn.Parameter(torch.randn(1, self.num_prompts, self.n_in))
 
         # Signed Attention 的投影层，用于计算方向（正负号）
-        self.sign_q = nn.Linear(args.embedding_dim, args.embedding_dim)
-        self.sign_k = nn.Linear(args.embedding_dim, args.embedding_dim)
+        self.sign_q = nn.Linear(self.n_in, self.n_in)
+        self.sign_k = nn.Linear(self.n_in, self.n_in)
 
         # Token 解码器：从 embedding 重构 new_tokens
-        # 输出维度: M * embedding_dim (M 个 prompt tokens，每个维度为 embedding_dim)
+        # 输出维度: M * n_in (M 个 prompt tokens，每个维度为 n_in)
         self.token_decoder = nn.Sequential(
-            nn.Linear(args.embedding_dim, args.embedding_dim),
+            nn.Linear(self.n_in, self.n_in),
             nn.ReLU(),
-            nn.Linear(args.embedding_dim, self.num_prompts * args.embedding_dim)
+            nn.Linear(self.n_in, self.num_prompts * self.n_in)
         )
 
         # 重构损失函数
         self.recon_loss_fn = nn.MSELoss()
 
-        # 投影层：将重构误差从 M*embedding_dim 维度投影到 embedding_dim 维度
+        # 投影层：将重构误差从 M*n_in 维度投影到 n_in 维度
         self.reconstruction_proj = nn.Sequential(
-            nn.Linear(self.num_prompts * args.embedding_dim, args.embedding_dim),
+            nn.Linear(self.num_prompts * self.n_in, self.n_in),
             nn.ReLU(),
-            nn.Linear(args.embedding_dim, args.embedding_dim)
+            nn.Linear(self.n_in, self.n_in)
         )
 
         # LayerNorm for new_tokens
-        self.new_tokens_ln = nn.LayerNorm(args.embedding_dim)
+        self.new_tokens_ln = nn.LayerNorm(self.n_in)
+
+        # 可学习的 CLS token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.n_in))
 
         # 将模型移动到指定设备
         self.to(self.device)
@@ -250,20 +252,17 @@ class PromptGAD(nn.Module):
                         注意：这里的 d_model 是 n_in (输入特征维度)
 
         Returns:
-            new_tokens: 提取的新视角 Token [Batch, M, embedding_dim]
+            new_tokens: 提取的新视角 Token [Batch, M, n_in]
             attn_weights: 注意力权重 [Batch, M, num_hops]，用于计算正交损失
         """
         B = raw_tokens.size(0)
         M = self.num_prompts
-        d_model = self.args.embedding_dim
-
-        # 先将原始 tokens 投影到 embedding_dim 维度
-        projected_tokens = self.token_projection(raw_tokens)  # [B, num_hops, embedding_dim]
+        d_model = self.n_in  # 使用 n_in 而不是 args.embedding_dim
 
         # 扩展 Prompt 匹配 Batch Size
-        Q = self.prompts.expand(B, -1, -1)  # [B, M, embedding_dim]
-        K = projected_tokens  # [B, num_hops, embedding_dim]
-        V = projected_tokens  # [B, num_hops, embedding_dim]
+        Q = self.prompts.expand(B, -1, -1)  # [B, M, n_in]
+        K = raw_tokens  # [B, num_hops, n_in] - 直接使用输入 tokens，不进行投影
+        V = raw_tokens  # [B, num_hops, n_in] - 直接使用输入 tokens，不进行投影
 
         # 1. 计算重要性 (Magnitude) - 传统的 Softmax
         # score: [B, M, num_hops]
@@ -280,7 +279,7 @@ class PromptGAD(nn.Module):
 
         # 4. 提取出全新视角的 Token!
         # new_tokens 相当于自适应地提取不同频域视角
-        new_tokens = torch.matmul(attn_weights, V)  # [B, M, embedding_dim]
+        new_tokens = torch.matmul(attn_weights, V)  # [B, M, n_in]
 
         # 对 new_tokens 应用 LayerNorm
         new_tokens = self.new_tokens_ln(new_tokens)
@@ -316,12 +315,12 @@ class PromptGAD(nn.Module):
     def TransformerEncoder(self, tokens):
         """
         Inputs:
-            - tokens: 输入节点的 tokens 序列，形状 [batch_size, pp_k+1, feature_dim]
+            - tokens: 输入节点的 tokens 序列，形状 [batch_size, pp_k+1, n_in]
         Outputs:
-            - emb: 输入节点的编码结果，形状 [1, batch_size, embedding_dim]
+            - emb: 输入节点的编码结果，形状 [1, batch_size, n_in]
         """
 
-        emb = self.token_projection(tokens)
+        emb = tokens  # 直接使用输入tokens，不进行投影
         for i, l in enumerate(self.layers):
             emb, current_attention_weights = self.layers[i](emb)
             if i == len(self.layers) - 1: # 拿到最后一层的注意力
@@ -335,7 +334,7 @@ class PromptGAD(nn.Module):
         attention_scores = agg_attention_weights[:, 0, :]
 
         # 基于 attention_scores 进行池化，得到最终编码结果
-        # emb: [1, N, embedding_dim]
+        # emb: [1, N, n_in]
         emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
 
         return emb
@@ -345,9 +344,9 @@ class PromptGAD(nn.Module):
         处理已经投影过的 tokens（包含原始 tokens 和 prompt tokens 的组合）
 
         Inputs:
-            - tokens: 已经投影过的 tokens 序列，形状 [batch_size, pp_k+1 + M, embedding_dim]
+            - tokens: 已经投影过的 tokens 序列，形状 [batch_size, pp_k+1 + M, n_in]
         Outputs:
-            - emb: 输入节点的编码结果，形状 [1, batch_size, embedding_dim]
+            - emb: 输入节点的编码结果，形状 [1, batch_size, n_in]
         """
         for i, l in enumerate(self.layers):
             tokens, current_attention_weights = self.layers[i](tokens)
@@ -363,7 +362,7 @@ class PromptGAD(nn.Module):
         attention_scores = agg_attention_weights[:, 0, :]
 
         # 基于 attention_scores 进行池化，得到最终编码结果
-        # emb: [1, N, embedding_dim]
+        # emb: [1, N, n_in]
         emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
 
         return emb
@@ -373,9 +372,9 @@ class PromptGAD(nn.Module):
         处理只有 new_tokens 的情况（不包含原始 tokens）
 
         Inputs:
-            - tokens: 已经投影过的 new_tokens 序列，形状 [batch_size, M, embedding_dim]
+            - tokens: 已经投影过的 new_tokens 序列，形状 [batch_size, M, n_in]
         Outputs:
-            - emb: 输入节点的编码结果，形状 [1, batch_size, embedding_dim]
+            - emb: 输入节点的编码结果，形状 [1, batch_size, n_in]
         """
         for i, l in enumerate(self.layers):
             tokens, current_attention_weights = self.layers[i](tokens)
@@ -392,27 +391,57 @@ class PromptGAD(nn.Module):
         attention_scores = torch.mean(agg_attention_weights, dim=1)
 
         # 基于 attention_scores 进行池化，得到最终编码结果
-        # emb: [1, N, embedding_dim]
+        # emb: [1, N, n_in]
         emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
 
         return emb
+
+    def TransformerEncoderWithCLS(self, tokens):
+        """
+        使用 CLS token 处理 tokens，CLS token 经过多层更新后直接作为输出
+
+        Inputs:
+            - tokens: 已经投影过的 new_tokens 序列，形状 [batch_size, M, n_in]
+        Outputs:
+            - emb: CLS token 的编码结果，形状 [1, batch_size, n_in]
+        """
+        batch_size = tokens.size(0)
+        
+        # 将 CLS token 扩展到 batch size
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [batch_size, 1, n_in]
+        
+        # 拼接 CLS token 和 new_tokens: [batch_size, 1+M, n_in]
+        tokens = torch.cat([cls_tokens, tokens], dim=1)
+        
+        # 经过所有 Transformer 层
+        for i, l in enumerate(self.layers):
+            tokens, _ = self.layers[i](tokens)
+        
+        # 应用 final LayerNorm
+        emb = self.final_ln(tokens)
+        
+        # 直接取 CLS token（第一个位置）作为输出
+        cls_output = emb[:, 0, :]  # [batch_size, n_in]
+        
+        # 调整形状为 [1, batch_size, n_in]
+        return cls_output.unsqueeze(0)
 
     def forward(self, input_tokens, adj, _, normal_for_train_idx, train_flag, args, sparse=False):
 
         # input_tokens: (N, args.pp_k+1, d)
 
         # 使用 tokenizer 提取 M 种不同的"频域视角"特征
-        # new_tokens: [N, M, embedding_dim]
+        # new_tokens: [N, M, n_in]
         # prompt_attn_weights: [N, M, pp_k+1]
         new_tokens, prompt_attn_weights = self.tokenizer(input_tokens)
 
         # 计算正交损失
         ortho_loss = self.compute_filter_orthogonal_loss(prompt_attn_weights)
 
-        # 只使用新视角 Token 进行编码
-        # 新视角 tokens: [N, M, embedding_dim]
-        # 直接使用 new_tokens 进行编码，不需要拼接旧 tokens
-        emb = self.TransformerEncoderWithNewTokens(new_tokens)
+        # 使用 CLS token 进行编码
+        # 新视角 tokens: [N, M, n_in]
+        # CLS token 与 new_tokens 一起经过 Transformer 层更新
+        emb = self.TransformerEncoderWithCLS(new_tokens)
         emb = F.normalize(emb, p=2, dim=-1)
         # 生成全局中心点
         h_mean = torch.mean(emb, dim=1, keepdim=True)
@@ -434,7 +463,7 @@ class PromptGAD(nn.Module):
         loss_rec = torch.tensor(0.0, device=emb.device)
         
         # 在训练或非训练模式下都计算重构 tokens（用于诊断）
-        # reconstructed_tokens: [num_nodes, M * embedding_dim]
+        # reconstructed_tokens: [num_nodes, M * n_in]
         reconstructed_tokens = self.token_decoder(emb).squeeze(0)
         original_new_tokens = new_tokens  # 保存原始的 new_tokens
         
@@ -453,15 +482,15 @@ class PromptGAD(nn.Module):
             # print(f"time for noise:{time.time() - start_time}")
 
             # 重构学习：重构目标是 new_tokens (Prompt Token 提取的频域视角)
-            # reconstructed_tokens: [num_nodes, M * embedding_dim]
+            # reconstructed_tokens: [num_nodes, M * n_in]
             reconstructed_tokens = self.token_decoder(emb).squeeze(0)
             
             # 计算重构误差，目标是 new_tokens
-            # new_tokens: [N, M, embedding_dim] -> flatten: [N, M * embedding_dim]
-            target_tokens = new_tokens.view(-1, self.num_prompts * args.embedding_dim)
+            # new_tokens: [N, M, n_in] -> flatten: [N, M * n_in]
+            target_tokens = new_tokens.view(-1, self.num_prompts * self.n_in)
             reconstruction_error = reconstructed_tokens - target_tokens
             
-            # Project reconstruction error to embedding dimension
+            # Project reconstruction error to n_in dimension
             reconstruction_error_proj = self.reconstruction_proj(reconstruction_error[normal_for_generation_idx, :])
             
             # 强制将误差向量归一化
@@ -507,9 +536,9 @@ class PromptGAD(nn.Module):
         else:
             # 在非训练模式下也计算重构误差向量（用于诊断）
             reconstructed_tokens = self.token_decoder(emb).squeeze(0)
-            target_tokens = new_tokens.view(-1, self.num_prompts * args.embedding_dim)
+            target_tokens = new_tokens.view(-1, self.num_prompts * self.n_in)
             reconstruction_error = reconstructed_tokens - target_tokens
-            # Project reconstruction error to embedding dimension for all nodes
+            # Project reconstruction error to n_in dimension for all nodes
             reconstruction_error_proj = self.reconstruction_proj(reconstruction_error)
             
            
@@ -530,16 +559,16 @@ class PromptGAD(nn.Module):
         使用 MSE 损失：基于重构前后的绝对值差异
         
         Args:
-            new_tokens: Prompt Token 提取的新视角 Token [N, M, embedding_dim]
-            reconstructed_tokens: 经过解码器重构的 Token 序列 [N, M * embedding_dim]
+            new_tokens: Prompt Token 提取的新视角 Token [N, M, n_in]
+            reconstructed_tokens: 经过解码器重构的 Token 序列 [N, M * n_in]
             normal_for_generation_emb: 正常节点的嵌入
             normal_for_generation_idx: 用于生成异常的正常节点索引
         Returns:
             loss_rec: 重构损失值
         """
         # 计算重构损失：目标是 new_tokens
-        # new_tokens: [N, M, embedding_dim] -> flatten: [N, M * embedding_dim]
-        target_tokens = new_tokens.view(-1, self.num_prompts * self.args.embedding_dim)
+        # new_tokens: [N, M, n_in] -> flatten: [N, M * n_in]
+        target_tokens = new_tokens.view(-1, self.num_prompts * self.n_in)
         
         # MSE 损失：基于绝对值差异
         # 计算每个样本的均方误差并平均
@@ -553,14 +582,14 @@ class PromptGAD(nn.Module):
         """
         计算InfoNCE均匀性损失，推开不同正常节点在嵌入空间中的距离
         Args:
-            emb: [1, N, embedding_dim] - 所有节点的嵌入表征
+            emb: [1, N, n_in] - 所有节点的嵌入表征
             normal_for_train_idx: 训练时使用的正常节点索引
             args: 包含GNA_temp等超参数的配置
         Returns:
             uniformity_loss: InfoNCE均匀性损失
         """
-        # 提取正常节点的嵌入: [num_normal, embedding_dim]
-        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, embedding_dim]
+        # 提取正常节点的嵌入: [num_normal, n_in]
+        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, n_in]
         num_normal = normal_emb.size(0)
         
         # 调试信息：打印正常节点数量
@@ -572,7 +601,7 @@ class PromptGAD(nn.Module):
             return torch.tensor(0.0, device=emb.device)
         
         # L2 归一化，便于计算余弦相似度
-        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)  # [num_normal, embedding_dim]
+        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)  # [num_normal, n_in]
         
         # 计算所有节点对之间的余弦相似度矩阵
         # similarity_matrix[i,j] = cos_sim(node_i, node_j)

@@ -33,14 +33,7 @@ To extract diverse frequency-domain perspectives from the token sequence, we int
 
 ### 2.1 Learnable Prompt Tokens
 
-We initialize $M$ learnable prompt tokens $\mathbf{P} \in \mathbb{R}^{M \times d}$, where $d$ is the embedding dimension and $M=8$ in practice. These prompts serve as learnable queries to extract different frequency characteristics.
-
-First, we project the raw tokens to the embedding space:
-$$
-\hat{\mathcal{T}}_i = \text{MLP}_{\text{proj}}(\mathcal{T}_i)
-$$
-
-where $\hat{\mathcal{T}}_i \in \mathbb{R}^{(k+1) \times d}$.
+We initialize $M$ learnable prompt tokens $\mathbf{P} \in \mathbb{R}^{M \times D}$, where $D$ is the original token dimension (same as input feature dimension) and $M=8$ in practice. These prompts serve as learnable queries to extract different frequency characteristics. Unlike the original implementation, we no longer project tokens to a separate embedding dimension. Instead, we work directly with the original token dimension $D$, eliminating the need for a separate embedding dimension.
 
 ### 2.2 Dynamic Filtering with Signed Attention
 
@@ -48,13 +41,13 @@ We compute both magnitude and sign components to form dynamic filters:
 
 **Magnitude (Importance):**
 $$
-\mathbf{S}_{\text{mag}} = \frac{\mathbf{Q} \mathbf{K}^T}{\sqrt{d}}
+\mathbf{S}_{\text{mag}} = \frac{\mathbf{Q} \mathbf{K}^T}{\sqrt{D}}
 $$
 $$
 \text{magnitude} = \text{softmax}(\mathbf{S}_{\text{mag}} / \tau)
 $$
 
-where $\mathbf{Q} = \mathbf{P}$ (expanded to batch size), $\mathbf{K} = \hat{\mathcal{T}}_i$, and $\tau$ is the temperature parameter.
+where $\mathbf{Q} = \mathbf{P}$ (expanded to batch size), $\mathbf{K} = \mathcal{T}_i$ (without projection), and $\tau$ is the temperature parameter.
 
 **Sign (Direction/Mutation):**
 $$
@@ -78,7 +71,7 @@ $$
 \text{new_tokens} = \text{attn_weights} \cdot \mathbf{V}
 $$
 
-where $\mathbf{V} = \hat{\mathcal{T}}_i$, and we apply LayerNorm to the extracted tokens.
+where $\mathbf{V} = \mathcal{T}_i$ (without projection), and we apply LayerNorm to the extracted tokens.
 
 ### 2.4 Orthogonality Loss
 
@@ -95,7 +88,7 @@ where $\mathbf{w}_{b,i}$ is the normalized filter weight for the $i$-th prompt i
 The extracted frequency-domain tokens are processed through a Graph Transformer encoder. The encoder consists of $L$ layers (we use $L=3$), each containing:
 
 - Multi-head self-attention with $H$ heads (we use $H=2$)
-- Feed-forward network (FFN) with hidden dimension 256
+- Feed-forward network (FFN) with hidden dimension matching the input token dimension $D$
 - Layer normalization and residual connections
 - Dropout for regularization
 
@@ -107,7 +100,7 @@ $$
 \mathbf{Z}^{(l+1)} = \text{LayerNorm}(\mathbf{Z}^{(l)} + \text{FFN}(\mathbf{Z}^{(l)}))
 $$
 
-After $L$ layers, we aggregate the final representations using attention pooling based on the last layer's attention weights, resulting in node embeddings $\mathbf{E} \in \mathbb{R}^{N \times d}$.
+After $L$ layers, we aggregate the final representations using attention pooling based on the last layer's attention weights, resulting in node embeddings $\mathbf{E} \in \mathbb{R}^{N \times D}$.
 
 ## 4 Reconstruction Learning and Synthetic Anomaly Generation
 
@@ -119,7 +112,7 @@ $$
 \hat{\text{tokens}} = \text{MLP}_{\text{dec}}(\mathbf{E})
 $$
 
-where $\hat{\text{tokens}} \in \mathbb{R}^{N \times (M \cdot d)}$. The reconstruction loss is:
+where $\hat{\text{tokens}} \in \mathbb{R}^{N \times (M \cdot D)}$. The reconstruction loss is:
 
 $$
 \text{loss}_{\text{rec}} = \text{MSE}(\hat{\text{tokens}}, \text{target_tokens})
@@ -129,7 +122,7 @@ where $\text{target_tokens}$ are the flattened original frequency-domain tokens.
 
 ### 4.2 Reconstruction Error as Anomaly Direction
 
-The reconstruction error is projected to the embedding space:
+The reconstruction error is projected to the same token space:
 
 $$
 \mathbf{R} = \text{MLP}_{\text{proj}}(\hat{\text{tokens}} - \text{target_tokens})
