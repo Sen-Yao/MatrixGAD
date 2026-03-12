@@ -517,7 +517,7 @@ class PromptGAD(nn.Module):
         """
         计算 Token 空间的重构损失
         重构目标是 new_tokens (Prompt Token 提取的频域视角)
-        使用余弦差异损失: 1 - cos(T, \hat T)
+        使用 MSE 损失：基于重构前后的绝对值差异
         
         Args:
             new_tokens: Prompt Token 提取的新视角 Token [N, M, embedding_dim]
@@ -531,17 +531,9 @@ class PromptGAD(nn.Module):
         # new_tokens: [N, M, embedding_dim] -> flatten: [N, M * embedding_dim]
         target_tokens = new_tokens.view(-1, self.num_prompts * self.args.embedding_dim)
         
-        # 余弦差异损失: 1 - cos(T, \hat T)
-        # 首先对向量进行 L2 归一化
-        target_norm = F.normalize(target_tokens, p=2, dim=1)
-        reconstructed_norm = F.normalize(reconstructed_tokens, p=2, dim=1)
-        
-        # 计算余弦相似度 (每个样本的点积)
-        cosine_sim = torch.sum(target_norm * reconstructed_norm, dim=1)
-        
-        # 余弦差异损失: 1 - cosine_similarity
-        # 范围: [0, 2]，其中 0 表示完全相同方向，2 表示完全相反方向
-        token_rec_loss = torch.mean(1 - cosine_sim)
+        # MSE 损失：基于绝对值差异
+        # 计算每个样本的均方误差并平均
+        token_rec_loss = F.mse_loss(reconstructed_tokens, target_tokens)
         
         return token_rec_loss
 
