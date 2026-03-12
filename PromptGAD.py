@@ -482,68 +482,33 @@ class PromptGAD(nn.Module):
             normal_for_generation_emb = emb[:, normal_for_generation_idx, :]
 
             # ==================== 新的伪异常生成逻辑 ====================
-            # 对每个正常节点，从原始输入 token 序列（在Prompt提取tokenizer前）随机选一个token，
-            # 替换成当前批次内其他随机正常节点的对应Token
-            # 正常前向：混洗后的Token序列正常过Prompt提取→Transformer编码→CLS输出，作为伪异常样本
+            # 被选取用于生成伪异常的那些正常节点，在tokenizer的过程中，随机mask掉hallucination_prompt_ratio倍数的prompt使用高温生成
+            # 其余prompt使用正常温度，然后这些伪异常prompt token正常过transformer编码器，其结果作为伪异常
 
-            # 获取当前批次用于生成异常的正常节点的原始token序列
-            batch_normal_tokens = input_tokens[normal_for_generation_idx, :, :]  # [num_normal_gen, num_hops+1, d]
-            
-            # 创建混洗后的token序列
-            shuffled_tokens = batch_normal_tokens.clone()
-            
-            # 随机选择token位置进行替换
-            num_nodes, num_hops_plus1, d_model = shuffled_tokens.shape
-            if num_nodes > 1:  # 确保至少有两个节点可以混洗
-                # 随机选择一个hop位置
-                hop_idx = torch.randint(0, num_hops_plus1, (1,)).item()
-                
-                # 对每个节点，随机选择另一个节点的对应hop token进行替换
-                for i in range(num_nodes):
-                    # 选择一个不同于当前节点的随机节点
-                    other_nodes = list(range(num_nodes))
-                    other_nodes.remove(i)
-                    if len(other_nodes) > 0:
-                        random_node_idx = random.choice(other_nodes)
-                        # 替换指定hop位置的token
-                        shuffled_tokens[i, hop_idx, :] = batch_normal_tokens[random_node_idx, hop_idx, :]
-                
-                # 对混洗后的token序列进行正常的Prompt提取→Transformer编码→CLS输出
-                # 使用混洗后的tokens进行tokenizer
-                # 注意：确保梯度可以正常回传，不冻结任何参数
-                shuffled_prompt_tokens, shuffled_prompt_attn_weights = self.tokenizer(shuffled_tokens, getattr(self.args, 'tokenizer_temp', 1.0))
-                
-                # 使用CLS token处理混洗后的prompt_tokens
-                # 确保梯度正常回传
-                shuffled_emb = self.TransformerEncoderWithCLS(shuffled_prompt_tokens)
-                shuffled_emb = F.normalize(shuffled_emb, p=2, dim=-1)
-                
-                # 将混洗后的嵌入作为伪异常样本
-                outlier_emb = shuffled_emb.squeeze(0)  # [num_normal_gen, n_in]
-            else:
-                # 如果节点数不够混洗，创建一个零张量作为伪异常样本（或采用其他策略）
-                # 这种情况下，我们仍然需要一个outlier_emb，即使它不包含真实的混洗信息
-                # 但需要注意这可能导致logits为0，所以我们要确保使用正常流程生成pseudo异常
-                # 如果没有足够的节点进行混洗，我们可以复制现有节点并稍作修改来创建伪异常
-                if len(normal_for_generation_idx) > 0:
-                    # 使用第一个节点的token作为基础，稍微扰动来创建伪异常
-                    base_tokens = batch_normal_tokens[0:1, :, :].expand(num_nodes, -1, -1).clone()
-                    # 添加轻微噪声以创建差异
-                    noise = torch.randn_like(base_tokens) * 0.01
-                    base_tokens = base_tokens + noise
-                    
-                    # 对扰动后的tokens进行正常的Prompt提取→Transformer编码→CLS输出
-                    shuffled_prompt_tokens, shuffled_prompt_attn_weights = self.tokenizer(base_tokens, getattr(self.args, 'tokenizer_temp', 1.0))
-                    
-                    # 使用CLS token处理扰动后的prompt_tokens
-                    shuffled_emb = self.TransformerEncoderWithCLS(shuffled_prompt_tokens)
-                    shuffled_emb = F.normalize(shuffled_emb, p=2, dim=-1)
-                    
-                    # 将扰动后的嵌入作为伪异常样本
-                    outlier_emb = shuffled_emb.squeeze(0)  # [num_normal_gen, n_in]
-                else:
-                    # 如果没有用于生成异常的节点，创建零张量
-                    outlier_emb = torch.zeros((len(normal_for_generation_idx), self.n_in), device=emb.device, dtype=emb.dtype)
+            # 获取用于生成伪异常的正常节点的原始token序列
+            batch_normal_tokens_for_generation = input_tokens[normal_for_generation_idx, :, :]  # [num_normal_gen, num_hops+1, d]
+
+            # 计算增温后的tokenizer温度
+            hallucinated_temp = getattr(self.args, 'tokenizer_temp', 1.0) * getattr(self.args, 'tokenizer_hallucination_ratio', 2.0)
+            normal_temp = getattr(self.args, 'tokenizer_temp', 1.0)
+
+            # 使用正常温度和高温分别处理tokens
+            normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
+            hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, hallucinated_temp)
+
+            # 创建随机mask，决定哪些prompt使用高温
+            B, M, d_model = normal_prompt_tokens.shape
+            mask = torch.rand(B, M, device=batch_normal_tokens_for_generation.device) < getattr(self.args, 'hallucination_prompt_ratio', 0.2)
+
+            # 根据mask混合正常和高温处理的prompt
+            mixed_prompt_tokens = torch.where(mask.unsqueeze(-1), hallucinated_prompt_tokens, normal_prompt_tokens)
+
+            # 使用CLS token处理混合后的prompt_tokens作为伪异常
+            hallucinated_emb = self.TransformerEncoderWithCLS(mixed_prompt_tokens)
+            hallucinated_emb = F.normalize(hallucinated_emb, p=2, dim=-1)
+
+            # 将混合处理后的嵌入作为伪异常样本
+            outlier_emb = hallucinated_emb.squeeze(0)  # [num_normal_gen, n_in]
 
             # ===========================================================
 

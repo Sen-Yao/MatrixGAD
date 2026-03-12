@@ -369,6 +369,8 @@ if __name__ == "__main__":
     parser.add_argument('--ortho_loss_weight', type=float, default=0.1, help='Weight for orthogonal loss of prompt tokens')
     parser.add_argument('--uniformity_loss_weight', type=float, default=0.1, help='Weight for InfoNCE uniformity loss between normal nodes')
     parser.add_argument('--tokenizer_temp', type=float, default=0.1, help='Temperature parameter for tokenizer attention computation')
+    parser.add_argument('--tokenizer_hallucination_ratio', type=float, default=2.0, help='Hallucination ratio multiplier for temperature during pseudo anomaly generation')
+    parser.add_argument('--hallucination_prompt_ratio', type=float, default=0.2, help='Ratio of prompts to apply hallucination temperature during pseudo anomaly generation')
 
     parser.add_argument('--warmup_updates', type=int, default=50)
     parser.add_argument('--tot_updates', type=int, default=1000)
