@@ -242,7 +242,7 @@ class PromptGAD(nn.Module):
         # 将模型移动到指定设备
         self.to(self.device)
 
-    def tokenizer(self, raw_tokens):
+    def tokenizer(self, raw_tokens, tokenizer_temp=None):
         """
         使用可学习的 Prompt Token 对原始 tokens 进行交叉注意力查询，
         提取 M 种不同的"频域视角"特征。
@@ -250,11 +250,16 @@ class PromptGAD(nn.Module):
         Args:
             raw_tokens: 原 NAGphormer 特征 [Batch, num_hops, d_model]
                         注意：这里的 d_model 是 n_in (输入特征维度)
+            tokenizer_temp: 温度参数，默认为 self.args.tokenizer_temp
 
         Returns:
             prompt_tokens: 提取的新视角 Token [Batch, M, n_in]
             attn_weights: 注意力权重 [Batch, M, num_hops]，用于计算正交损失
         """
+        # 如果没有传入 tokenizer_temp，则使用默认值
+        if tokenizer_temp is None:
+            tokenizer_temp = self.args.tokenizer_temp
+            
         B = raw_tokens.size(0)
         M = self.num_prompts
         d_model = self.n_in  # 使用 n_in 而不是 args.embedding_dim
@@ -267,12 +272,12 @@ class PromptGAD(nn.Module):
         # 1. 计算重要性 (Magnitude) - 传统的 Softmax
         # score: [B, M, num_hops]
         score_mag = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(d_model)
-        magnitude = F.softmax(score_mag / self.args.tokenizer_temp, dim=-1)
+        magnitude = F.softmax(score_mag / tokenizer_temp, dim=-1)
 
         # 2. 计算方向/突变 (Sign) - 打破低通滤波诅咒的关键！
         # range: [-1, 1]
         score_sign = torch.matmul(self.sign_q(Q), self.sign_k(K).transpose(-1, -2))
-        sign = torch.tanh(score_sign / self.args.tokenizer_temp)
+        sign = torch.tanh(score_sign / tokenizer_temp)
 
         # 3. 合成动态滤波器权重
         attn_weights = magnitude * sign  # [B, M, num_hops]
@@ -433,7 +438,7 @@ class PromptGAD(nn.Module):
         # 使用 tokenizer 提取 M 种不同的"频域视角"特征
         # prompt_tokens: [N, M, n_in]
         # prompt_attn_weights: [N, M, pp_k+1]
-        prompt_tokens, prompt_attn_weights = self.tokenizer(input_tokens)
+        prompt_tokens, prompt_attn_weights = self.tokenizer(input_tokens, getattr(self.args, 'tokenizer_temp', 1.0))
 
         # 计算正交损失
         ortho_loss = self.compute_filter_orthogonal_loss(prompt_attn_weights)
@@ -506,7 +511,7 @@ class PromptGAD(nn.Module):
                 # 对混洗后的token序列进行正常的Prompt提取→Transformer编码→CLS输出
                 # 使用混洗后的tokens进行tokenizer
                 # 注意：确保梯度可以正常回传，不冻结任何参数
-                shuffled_prompt_tokens, shuffled_prompt_attn_weights = self.tokenizer(shuffled_tokens)
+                shuffled_prompt_tokens, shuffled_prompt_attn_weights = self.tokenizer(shuffled_tokens, getattr(self.args, 'tokenizer_temp', 1.0))
                 
                 # 使用CLS token处理混洗后的prompt_tokens
                 # 确保梯度正常回传
@@ -528,7 +533,7 @@ class PromptGAD(nn.Module):
                     base_tokens = base_tokens + noise
                     
                     # 对扰动后的tokens进行正常的Prompt提取→Transformer编码→CLS输出
-                    shuffled_prompt_tokens, shuffled_prompt_attn_weights = self.tokenizer(base_tokens)
+                    shuffled_prompt_tokens, shuffled_prompt_attn_weights = self.tokenizer(base_tokens, getattr(self.args, 'tokenizer_temp', 1.0))
                     
                     # 使用CLS token处理扰动后的prompt_tokens
                     shuffled_emb = self.TransformerEncoderWithCLS(shuffled_prompt_tokens)
