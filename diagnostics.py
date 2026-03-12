@@ -394,193 +394,63 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
         diagnostics['outlier_closer_to_abnorm'] = False
     
     # ==========================================
-    # Probe 5: Reconstruction Error Vector Magnitude Distribution
-    # ==========================================
-    if concatenated_rec_errors is not None:
-        # 计算所有节点的重构误差向量模长 ||R_i||
-        rec_error_magnitudes = torch.norm(concatenated_rec_errors, p=2, dim=1)
-        
-        # 分别计算正常点和异常点的模长
-        norm_rec_magnitudes = rec_error_magnitudes[norm_mask]
-        abnorm_rec_magnitudes = rec_error_magnitudes[abnorm_mask]
-        
-        # 正常点模长统计
-        if len(norm_rec_magnitudes) > 0:
-            diagnostics['norm_rec_mag_mean'] = norm_rec_magnitudes.mean().item()
-            diagnostics['norm_rec_mag_std'] = norm_rec_magnitudes.std().item()
-            diagnostics['norm_rec_mag_min'] = norm_rec_magnitudes.min().item()
-            diagnostics['norm_rec_mag_max'] = norm_rec_magnitudes.max().item()
-            diagnostics['norm_rec_mag_median'] = norm_rec_magnitudes.median().item()
-            # 计算分位数
-            diagnostics['norm_rec_mag_q25'] = torch.quantile(norm_rec_magnitudes, 0.25).item()
-            diagnostics['norm_rec_mag_q75'] = torch.quantile(norm_rec_magnitudes, 0.75).item()
-        else:
-            diagnostics['norm_rec_mag_mean'] = float('nan')
-            diagnostics['norm_rec_mag_std'] = float('nan')
-            diagnostics['norm_rec_mag_min'] = float('nan')
-            diagnostics['norm_rec_mag_max'] = float('nan')
-            diagnostics['norm_rec_mag_median'] = float('nan')
-            diagnostics['norm_rec_mag_q25'] = float('nan')
-            diagnostics['norm_rec_mag_q75'] = float('nan')
-        
-        # 异常点模长统计
-        if len(abnorm_rec_magnitudes) > 0:
-            diagnostics['abnorm_rec_mag_mean'] = abnorm_rec_magnitudes.mean().item()
-            diagnostics['abnorm_rec_mag_std'] = abnorm_rec_magnitudes.std().item()
-            diagnostics['abnorm_rec_mag_min'] = abnorm_rec_magnitudes.min().item()
-            diagnostics['abnorm_rec_mag_max'] = abnorm_rec_magnitudes.max().item()
-            diagnostics['abnorm_rec_mag_median'] = abnorm_rec_magnitudes.median().item()
-            # 计算分位数
-            diagnostics['abnorm_rec_mag_q25'] = torch.quantile(abnorm_rec_magnitudes, 0.25).item()
-            diagnostics['abnorm_rec_mag_q75'] = torch.quantile(abnorm_rec_magnitudes, 0.75).item()
-        else:
-            diagnostics['abnorm_rec_mag_mean'] = float('nan')
-            diagnostics['abnorm_rec_mag_std'] = float('nan')
-            diagnostics['abnorm_rec_mag_min'] = float('nan')
-            diagnostics['abnorm_rec_mag_max'] = float('nan')
-            diagnostics['abnorm_rec_mag_median'] = float('nan')
-            diagnostics['abnorm_rec_mag_q25'] = float('nan')
-            diagnostics['abnorm_rec_mag_q75'] = float('nan')
-        
-        # 计算模长差异的统计显著性
-        if len(norm_rec_magnitudes) > 0 and len(abnorm_rec_magnitudes) > 0:
-            # 模长差异（异常点模长 - 正常点模长）
-            mag_diff = diagnostics['abnorm_rec_mag_mean'] - diagnostics['norm_rec_mag_mean']
-            diagnostics['rec_mag_diff'] = mag_diff
-            # 模长比率（异常点模长 / 正常点模长）
-            diagnostics['rec_mag_ratio'] = diagnostics['abnorm_rec_mag_mean'] / (diagnostics['norm_rec_mag_mean'] + 1e-8)
-        else:
-            diagnostics['rec_mag_diff'] = float('nan')
-            diagnostics['rec_mag_ratio'] = float('nan')
-        
-        # 存储原始模长数据（用于可视化）
-        diagnostics['norm_rec_magnitudes'] = norm_rec_magnitudes.numpy()
-        diagnostics['abnorm_rec_magnitudes'] = abnorm_rec_magnitudes.numpy()
-    else:
-        diagnostics['norm_rec_mag_mean'] = float('nan')
-        diagnostics['norm_rec_mag_std'] = float('nan')
-        diagnostics['norm_rec_mag_min'] = float('nan')
-        diagnostics['norm_rec_mag_max'] = float('nan')
-        diagnostics['norm_rec_mag_median'] = float('nan')
-        diagnostics['norm_rec_mag_q25'] = float('nan')
-        diagnostics['norm_rec_mag_q75'] = float('nan')
-        diagnostics['abnorm_rec_mag_mean'] = float('nan')
-        diagnostics['abnorm_rec_mag_std'] = float('nan')
-        diagnostics['abnorm_rec_mag_min'] = float('nan')
-        diagnostics['abnorm_rec_mag_max'] = float('nan')
-        diagnostics['abnorm_rec_mag_median'] = float('nan')
-        diagnostics['abnorm_rec_mag_q25'] = float('nan')
-        diagnostics['abnorm_rec_mag_q75'] = float('nan')
-        diagnostics['rec_mag_diff'] = float('nan')
-        diagnostics['rec_mag_ratio'] = float('nan')
-        diagnostics['norm_rec_magnitudes'] = None
-        diagnostics['abnorm_rec_magnitudes'] = None
-    
-    # ==========================================
-    # Probe 6: Token L2 Norm Comparison (新增)
-    # 用于比较原始 token 和重构 token 的 L2 范数
-    # ==========================================
-    if concatenated_original_tokens is not None and concatenated_reconstructed_tokens is not None:
-        # 将 original_tokens 展平为 [N, M * embedding_dim] 以匹配 reconstructed_tokens
-        num_nodes = concatenated_original_tokens.size(0)
-        num_prompts = concatenated_original_tokens.size(1)
-        embedding_dim = concatenated_original_tokens.size(2)
-        
-        original_tokens_flat = concatenated_original_tokens.view(num_nodes, num_prompts * embedding_dim)
-        
-        # 计算每个样本原始 token 的 L2 范数
-        original_token_norms = torch.norm(original_tokens_flat, p=2, dim=1)
-        
-        # 计算每个样本重构 token 的 L2 范数
-        reconstructed_token_norms = torch.norm(concatenated_reconstructed_tokens, p=2, dim=1)
-        
-        # 计算每个样本原始 token 和重构 token 之间的 L2 距离
-        token_diff_norms = torch.norm(original_tokens_flat - concatenated_reconstructed_tokens, p=2, dim=1)
-        
-        # 分别计算正常点和异常点的统计
-        norm_original_norms = original_token_norms[norm_mask]
-        abnorm_original_norms = original_token_norms[abnorm_mask]
-        norm_reconstructed_norms = reconstructed_token_norms[norm_mask]
-        abnorm_reconstructed_norms = reconstructed_token_norms[abnorm_mask]
-        norm_diff_norms = token_diff_norms[norm_mask]
-        abnorm_diff_norms = token_diff_norms[abnorm_mask]
-        
-        # 原始 token 范数统计
-        if len(norm_original_norms) > 0:
-            diagnostics['token_orig_norm_mean'] = norm_original_norms.mean().item()
-            diagnostics['token_orig_norm_std'] = norm_original_norms.std().item()
-            diagnostics['token_orig_norm_min'] = norm_original_norms.min().item()
-            diagnostics['token_orig_norm_max'] = norm_original_norms.max().item()
-        else:
-            diagnostics['token_orig_norm_mean'] = float('nan')
-            diagnostics['token_orig_norm_std'] = float('nan')
-            diagnostics['token_orig_norm_min'] = float('nan')
-            diagnostics['token_orig_norm_max'] = float('nan')
-        
-        # 重构 token 范数统计
-        if len(norm_reconstructed_norms) > 0:
-            diagnostics['token_rec_norm_mean'] = norm_reconstructed_norms.mean().item()
-            diagnostics['token_rec_norm_std'] = norm_reconstructed_norms.std().item()
-            diagnostics['token_rec_norm_min'] = norm_reconstructed_norms.min().item()
-            diagnostics['token_rec_norm_max'] = norm_reconstructed_norms.max().item()
-        else:
-            diagnostics['token_rec_norm_mean'] = float('nan')
-            diagnostics['token_rec_norm_std'] = float('nan')
-            diagnostics['token_rec_norm_min'] = float('nan')
-            diagnostics['token_rec_norm_max'] = float('nan')
-        
-        # 差异范数统计（原始 vs 重构）
-        if len(norm_diff_norms) > 0:
-            diagnostics['token_diff_norm_mean'] = norm_diff_norms.mean().item()
-            diagnostics['token_diff_norm_std'] = norm_diff_norms.std().item()
-            diagnostics['token_diff_norm_min'] = norm_diff_norms.min().item()
-            diagnostics['token_diff_norm_max'] = norm_diff_norms.max().item()
-            if len(abnorm_diff_norms) > 0:
-                diagnostics['token_diff_norm_abnorm_mean'] = abnorm_diff_norms.mean().item()
-                diagnostics['token_diff_norm_abnorm_std'] = abnorm_diff_norms.std().item()
-            else:
-                diagnostics['token_diff_norm_abnorm_mean'] = float('nan')
-                diagnostics['token_diff_norm_abnorm_std'] = float('nan')
-        else:
-            diagnostics['token_diff_norm_mean'] = float('nan')
-            diagnostics['token_diff_norm_std'] = float('nan')
-            diagnostics['token_diff_norm_min'] = float('nan')
-            diagnostics['token_diff_norm_max'] = float('nan')
-            diagnostics['token_diff_norm_abnorm_mean'] = float('nan')
-            diagnostics['token_diff_norm_abnorm_std'] = float('nan')
-        
-        # 范数比率统计（重构 / 原始）
-        if len(norm_original_norms) > 0 and len(norm_reconstructed_norms) > 0:
-            norm_ratio = norm_reconstructed_norms / (norm_original_norms + 1e-8)
-            diagnostics['token_norm_ratio_mean'] = norm_ratio.mean().item()
-            diagnostics['token_norm_ratio_std'] = norm_ratio.std().item()
-        else:
-            diagnostics['token_norm_ratio_mean'] = float('nan')
-            diagnostics['token_norm_ratio_std'] = float('nan')
-    else:
-        diagnostics['token_orig_norm_mean'] = float('nan')
-        diagnostics['token_orig_norm_std'] = float('nan')
-        diagnostics['token_orig_norm_min'] = float('nan')
-        diagnostics['token_orig_norm_max'] = float('nan')
-        diagnostics['token_rec_norm_mean'] = float('nan')
-        diagnostics['token_rec_norm_std'] = float('nan')
-        diagnostics['token_rec_norm_min'] = float('nan')
-        diagnostics['token_rec_norm_max'] = float('nan')
-        diagnostics['token_diff_norm_mean'] = float('nan')
-        diagnostics['token_diff_norm_std'] = float('nan')
-        diagnostics['token_diff_norm_min'] = float('nan')
-        diagnostics['token_diff_norm_max'] = float('nan')
-        diagnostics['token_diff_norm_abnorm_mean'] = float('nan')
-        diagnostics['token_diff_norm_abnorm_std'] = float('nan')
-        diagnostics['token_norm_ratio_mean'] = float('nan')
-        diagnostics['token_norm_ratio_std'] = float('nan')
-    
-    # ==========================================
     # Sample Statistics
     # ==========================================
     diagnostics['num_normal'] = norm_embs.size(0) if norm_embs.size(0) > 0 else 0
     diagnostics['num_abnormal'] = abnorm_embs.size(0) if abnorm_embs.size(0) > 0 else 0
     diagnostics['num_outlier'] = outlier_embs.size(0) if outlier_embs is not None else 0
+    
+    # ==========================================
+    # Pseudo Anomaly Quality Metrics
+    # ==========================================
+    if outlier_embs is not None and outlier_embs.size(0) > 0:
+        # Normalize embeddings for cosine similarity calculation
+        norm_embs_normalized = torch.nn.functional.normalize(norm_embs, p=2, dim=1)
+        outlier_embs_normalized = torch.nn.functional.normalize(outlier_embs, p=2, dim=1)
+        
+        # Pseudo Anomaly Difficulty Coefficient
+        # Calculate cosine similarity between random 1000 normal nodes and 1000 pseudo anomalies
+        num_normal_sample = min(1000, norm_embs_normalized.size(0))
+        num_outlier_sample = min(1000, outlier_embs_normalized.size(0))
+        
+        # Randomly sample normal and outlier embeddings
+        if norm_embs_normalized.size(0) >= num_normal_sample:
+            sampled_norm_embs = norm_embs_normalized[torch.randperm(norm_embs_normalized.size(0))[:num_normal_sample]]
+        else:
+            sampled_norm_embs = norm_embs_normalized
+        
+        if outlier_embs_normalized.size(0) >= num_outlier_sample:
+            sampled_outlier_embs = outlier_embs_normalized[torch.randperm(outlier_embs_normalized.size(0))[:num_outlier_sample]]
+        else:
+            sampled_outlier_embs = outlier_embs_normalized
+        
+        # Calculate cosine similarities between normal nodes and pseudo anomalies
+        cos_sim_matrix = torch.mm(sampled_norm_embs, sampled_outlier_embs.t())
+        pseudo_anomaly_difficulty_coeff = cos_sim_matrix.mean().item()
+        
+        diagnostics['pseudo_anomaly_difficulty_coeff'] = pseudo_anomaly_difficulty_coeff
+        
+        # Pseudo Anomaly Authenticity Score
+        # Calculate cosine similarity between pseudo anomalies and true anomalies
+        if abnorm_embs.size(0) > 0:
+            abnorm_embs_normalized = torch.nn.functional.normalize(abnorm_embs, p=2, dim=1)
+            # Sample from true anomalies if there are more than 1000
+            num_abnorm_sample = min(1000, abnorm_embs_normalized.size(0))
+            if abnorm_embs_normalized.size(0) >= num_abnorm_sample:
+                sampled_abnorm_embs = abnorm_embs_normalized[torch.randperm(abnorm_embs_normalized.size(0))[:num_abnorm_sample]]
+            else:
+                sampled_abnorm_embs = abnorm_embs_normalized
+            
+            # Calculate cosine similarities between pseudo anomalies and true anomalies
+            cos_sim_matrix_true = torch.mm(sampled_outlier_embs, sampled_abnorm_embs.t())
+            pseudo_anomaly_authenticity_score = cos_sim_matrix_true.mean().item()
+            
+            diagnostics['pseudo_anomaly_authenticity_score'] = pseudo_anomaly_authenticity_score
+        else:
+            diagnostics['pseudo_anomaly_authenticity_score'] = float('nan')
+    else:
+        diagnostics['pseudo_anomaly_difficulty_coeff'] = float('nan')
+        diagnostics['pseudo_anomaly_authenticity_score'] = float('nan')
     
     return diagnostics
 
@@ -690,30 +560,9 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
         print(f"  TriGeo: N→O={d['dist_norm_outlier']:.3f}, N→A={d['dist_norm_abnorm']:.3f}, O→A={d['dist_outlier_abnorm']:.3f} | "
               f"angle={d['angle_degrees']:.1f}°, cos_sim={d['cos_sim_directions']:.3f} | outlier→abnorm closer: {closer_str}")
     
-    # Line 6: Reconstruction Error Vector Magnitude Distribution
-    if not np.isnan(d.get('norm_rec_mag_mean', float('nan'))):
-        print(f"  RecMag: ||R_i|| 分布:")
-        print(f"    正常点: mean={d['norm_rec_mag_mean']:.4f}(±{d['norm_rec_mag_std']:.4f}), "
-              f"median={d['norm_rec_mag_median']:.4f}, [{d['norm_rec_mag_q25']:.4f}, {d['norm_rec_mag_q75']:.4f}], "
-              f"min={d['norm_rec_mag_min']:.4f}, max={d['norm_rec_mag_max']:.4f}")
-        if not np.isnan(d.get('abnorm_rec_mag_mean', float('nan'))):
-            print(f"    异常点: mean={d['abnorm_rec_mag_mean']:.4f}(±{d['abnorm_rec_mag_std']:.4f}), "
-                  f"median={d['abnorm_rec_mag_median']:.4f}, [{d['abnorm_rec_mag_q25']:.4f}, {d['abnorm_rec_mag_q75']:.4f}], "
-                  f"min={d['abnorm_rec_mag_min']:.4f}, max={d['abnorm_rec_mag_max']:.4f}")
-            print(f"    差异: diff={d['rec_mag_diff']:.4f}, ratio={d['rec_mag_ratio']:.4f}x")
-    
-    # Line 7: Token L2 Norm Comparison (新增)
-    if not np.isnan(d.get('token_orig_norm_mean', float('nan'))):
-        print(f"  TokenNorm: Token 重构质量比较:")
-        print(f"    原始 Token (Tokenizer 输出): mean={d['token_orig_norm_mean']:.4f}(±{d['token_orig_norm_std']:.4f}), "
-              f"min={d['token_orig_norm_min']:.4f}, max={d['token_orig_norm_max']:.4f}")
-        if not np.isnan(d.get('token_rec_norm_mean', float('nan'))):
-            print(f"    重构 Token (Decoder 输出): mean={d['token_rec_norm_mean']:.4f}(±{d['token_rec_norm_std']:.4f}), "
-                  f"min={d['token_rec_norm_min']:.4f}, max={d['token_rec_norm_max']:.4f}")
-        if not np.isnan(d.get('token_diff_norm_mean', float('nan'))):
-            print(f"    重构误差 (原始 vs 重构): mean={d['token_diff_norm_mean']:.4f}(±{d['token_diff_norm_std']:.4f}), "
-                  f"min={d['token_diff_norm_min']:.4f}, max={d['token_diff_norm_max']:.4f}")
-            if not np.isnan(d.get('token_diff_norm_abnorm_mean', float('nan'))):
-                print(f"    异常点重构误差: mean={d['token_diff_norm_abnorm_mean']:.4f}(±{d['token_diff_norm_abnorm_std']:.4f})")
-        if not np.isnan(d.get('token_norm_ratio_mean', float('nan'))):
-            print(f"    范数比率 (重构/原始): mean={d['token_norm_ratio_mean']:.4f}(±{d['token_norm_ratio_std']:.4f})")
+    # Line 6: Pseudo Anomaly Quality Metrics
+    if not np.isnan(d.get('pseudo_anomaly_difficulty_coeff', float('nan'))):
+        print(f"  PseudoAnomaly: 伪异常质量评估:")
+        print(f"    伪异常难度系数: {d['pseudo_anomaly_difficulty_coeff']:.4f}")
+        if not np.isnan(d.get('pseudo_anomaly_authenticity_score', float('nan'))):
+            print(f"    伪异常真实性分数: {d['pseudo_anomaly_authenticity_score']:.4f}")
