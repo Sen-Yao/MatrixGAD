@@ -537,8 +537,12 @@ class PromptGAD(nn.Module):
         normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, embedding_dim]
         num_normal = normal_emb.size(0)
         
+        # 调试信息：打印正常节点数量
+        # print(f"[DEBUG] num_normal in batch: {num_normal}")
+        
         # 如果正常节点数量少于2，无法计算InfoNCE损失
         if num_normal < 2:
+            # print(f"[WARNING] num_normal={num_normal} < 2, returning 0.0 for uniformity_loss")
             return torch.tensor(0.0, device=emb.device)
         
         # L2 归一化，便于计算余弦相似度

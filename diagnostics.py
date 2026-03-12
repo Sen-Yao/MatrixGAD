@@ -469,6 +469,60 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     return diagnostics
 
 
+def _format_value(value, precision=4, threshold=0.001):
+    """
+    自适应格式化数值：对于小数值使用科学计数法，对于正常值使用小数格式
+    
+    Args:
+        value: 要格式化的数值
+        precision: 小数格式的精度（小数点后位数）
+        threshold: 使用科学计数法的阈值（绝对值小于此值时使用科学计数法）
+    
+    Returns:
+        格式化后的字符串
+    """
+    import math
+    if math.isnan(value) or math.isinf(value):
+        return f"{value}"
+    
+    abs_val = abs(value)
+    if abs_val == 0:
+        return f"{value:.{precision}f}"
+    elif abs_val < threshold:
+        # 使用科学计数法，保留2位有效数字
+        return f"{value:.2e}"
+    else:
+        return f"{value:.{precision}f}"
+
+
+def _format_weight(weight):
+    """
+    自适应格式化权重值：根据大小选择合适的显示格式
+    
+    Args:
+        weight: 权重值
+    
+    Returns:
+        格式化后的字符串（不包含'x'后缀）
+    """
+    import math
+    if math.isnan(weight) or math.isinf(weight):
+        return f"{weight}"
+    
+    abs_val = abs(weight)
+    if abs_val == 0:
+        return "0"
+    elif abs_val < 0.01:
+        # 小于 0.01 使用科学计数法
+        return f"{weight:.1e}"
+    elif abs_val < 1:
+        # 0.01 到 1 之间，显示 2 位小数
+        return f"{weight:.2f}"
+    else:
+        # 大于等于 1，显示 1 位小数
+        return f"{weight:.1f}"
+
+
 def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_weights=None, ortho_loss_weight=None):
     """
     Print diagnostic info in compact format
@@ -496,7 +550,11 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
         weighted_ortho = losses.get('ortho', 0.0) * w_ortho
         weighted_uni = losses.get('uniformity', 0.0) * w_uni
         print(f"[Diag@E{epoch}] lr={current_lr:.2e} | "
-              f"Loss(w): BCE={weighted_bce:.4f}({w_bce:.1f}x), Rec={weighted_rec:.4f}({w_rec:.1f}x), Ring={weighted_ring:.4f}({w_ring:.1f}x), Ortho={weighted_ortho:.4f}({w_ortho:.1f}x), Uni={weighted_uni:.4f}({w_uni:.1f}x)")
+              f"Loss(w): BCE={_format_value(weighted_bce)}({_format_weight(w_bce)}x), "
+              f"Rec={_format_value(weighted_rec)}({_format_weight(w_rec)}x), "
+              f"Ring={_format_value(weighted_ring)}({_format_weight(w_ring)}x), "
+              f"Ortho={_format_value(weighted_ortho)}({_format_weight(w_ortho)}x), "
+              f"Uni={_format_value(weighted_uni)}({_format_weight(w_uni)}x)")
     
     # Line 2: Logit analysis (including pseudo-anomaly/outlier)
     outlier_logit_str = ""
