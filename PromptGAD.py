@@ -215,7 +215,7 @@ class PromptGAD(nn.Module):
         self.sign_q = nn.Linear(self.n_in, self.n_in)
         self.sign_k = nn.Linear(self.n_in, self.n_in)
 
-        # Token 解码器：从 embedding 重构 new_tokens
+        # Token 解码器：从 embedding 重构 prompt_tokens
         # 输出维度: M * n_in (M 个 prompt tokens，每个维度为 n_in)
         self.token_decoder = nn.Sequential(
             nn.Linear(self.n_in, self.n_in),
@@ -233,8 +233,8 @@ class PromptGAD(nn.Module):
             nn.Linear(self.n_in, self.n_in)
         )
 
-        # LayerNorm for new_tokens
-        self.new_tokens_ln = nn.LayerNorm(self.n_in)
+        # LayerNorm for prompt_tokens
+        self.prompt_tokens_ln = nn.LayerNorm(self.n_in)
 
         # 可学习的 CLS token
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.n_in))
@@ -252,7 +252,7 @@ class PromptGAD(nn.Module):
                         注意：这里的 d_model 是 n_in (输入特征维度)
 
         Returns:
-            new_tokens: 提取的新视角 Token [Batch, M, n_in]
+            prompt_tokens: 提取的新视角 Token [Batch, M, n_in]
             attn_weights: 注意力权重 [Batch, M, num_hops]，用于计算正交损失
         """
         B = raw_tokens.size(0)
@@ -278,14 +278,14 @@ class PromptGAD(nn.Module):
         attn_weights = magnitude * sign  # [B, M, num_hops]
 
         # 4. 提取出全新视角的 Token!
-        # new_tokens 相当于自适应地提取不同频域视角
-        new_tokens = torch.matmul(attn_weights, V)  # [B, M, n_in]
+        # prompt_tokens 相当于自适应地提取不同频域视角
+        prompt_tokens = torch.matmul(attn_weights, V)  # [B, M, n_in]
 
-        # 对 new_tokens 应用 LayerNorm
-        new_tokens = self.new_tokens_ln(new_tokens)
+        # 对 prompt_tokens 应用 LayerNorm
+        prompt_tokens = self.prompt_tokens_ln(prompt_tokens)
 
         # 我们把 attn_weights 一起返回，为了算正交 Loss
-        return new_tokens, attn_weights
+        return prompt_tokens, attn_weights
 
     def compute_filter_orthogonal_loss(self, attn_weights):
         """
@@ -367,12 +367,12 @@ class PromptGAD(nn.Module):
 
         return emb
 
-    def TransformerEncoderWithNewTokens(self, tokens):
+    def TransformerEncoderWithPromptTokens(self, tokens):
         """
-        处理只有 new_tokens 的情况（不包含原始 tokens）
+        处理只有 prompt_tokens 的情况（不包含原始 tokens）
 
         Inputs:
-            - tokens: 已经投影过的 new_tokens 序列，形状 [batch_size, M, n_in]
+            - tokens: 已经投影过的 prompt_tokens 序列，形状 [batch_size, M, n_in]
         Outputs:
             - emb: 输入节点的编码结果，形状 [1, batch_size, n_in]
         """
@@ -385,7 +385,7 @@ class PromptGAD(nn.Module):
                 # agg_attention_weights: [N, M, M]
         emb = self.final_ln(tokens)
 
-        # 由于只有 M 个 new_tokens，没有特定的 0-hop 位置
+        # 由于只有 M 个 prompt_tokens，没有特定的 0-hop 位置
         # 我们对所有位置的注意力进行平均池化，得到统一的注意力分数
         # attention_scores: [N, M]，对每一行进行平均
         attention_scores = torch.mean(agg_attention_weights, dim=1)
@@ -401,7 +401,7 @@ class PromptGAD(nn.Module):
         使用 CLS token 处理 tokens，CLS token 经过多层更新后直接作为输出
 
         Inputs:
-            - tokens: 已经投影过的 new_tokens 序列，形状 [batch_size, M, n_in]
+            - tokens: 已经投影过的 prompt_tokens 序列，形状 [batch_size, M, n_in]
         Outputs:
             - emb: CLS token 的编码结果，形状 [1, batch_size, n_in]
         """
@@ -410,7 +410,7 @@ class PromptGAD(nn.Module):
         # 将 CLS token 扩展到 batch size
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [batch_size, 1, n_in]
         
-        # 拼接 CLS token 和 new_tokens: [batch_size, 1+M, n_in]
+        # 拼接 CLS token 和 prompt_tokens: [batch_size, 1+M, n_in]
         tokens = torch.cat([cls_tokens, tokens], dim=1)
         
         # 经过所有 Transformer 层
@@ -431,17 +431,17 @@ class PromptGAD(nn.Module):
         # input_tokens: (N, args.pp_k+1, d)
 
         # 使用 tokenizer 提取 M 种不同的"频域视角"特征
-        # new_tokens: [N, M, n_in]
+        # prompt_tokens: [N, M, n_in]
         # prompt_attn_weights: [N, M, pp_k+1]
-        new_tokens, prompt_attn_weights = self.tokenizer(input_tokens)
+        prompt_tokens, prompt_attn_weights = self.tokenizer(input_tokens)
 
         # 计算正交损失
         ortho_loss = self.compute_filter_orthogonal_loss(prompt_attn_weights)
 
         # 使用 CLS token 进行编码
         # 新视角 tokens: [N, M, n_in]
-        # CLS token 与 new_tokens 一起经过 Transformer 层更新
-        emb = self.TransformerEncoderWithCLS(new_tokens)
+        # CLS token 与 prompt_tokens 一起经过 Transformer 层更新
+        emb = self.TransformerEncoderWithCLS(prompt_tokens)
         emb = F.normalize(emb, p=2, dim=-1)
         # 生成全局中心点
         h_mean = torch.mean(emb, dim=1, keepdim=True)
@@ -452,7 +452,7 @@ class PromptGAD(nn.Module):
         reconstruction_error_proj = None  # 重构误差向量 R_i
         
         # 初始化用于诊断的 token 存储
-        original_new_tokens = None  # 原始 tokenizer 输出的 tokens
+        original_prompt_tokens = None  # 原始 tokenizer 输出的 tokens
         reconstructed_tokens = None  # 重构后的 tokens
 
         gna_loss = torch.tensor(0.0, device=emb.device)
@@ -465,7 +465,7 @@ class PromptGAD(nn.Module):
         # 在训练或非训练模式下都计算重构 tokens（用于诊断）
         # reconstructed_tokens: [num_nodes, M * n_in]
         reconstructed_tokens = self.token_decoder(emb).squeeze(0)
-        original_new_tokens = new_tokens  # 保存原始的 new_tokens
+        original_prompt_tokens = prompt_tokens  # 保存原始的 prompt_tokens
         
         if train_flag:
             # start_time = time.time()
@@ -506,11 +506,11 @@ class PromptGAD(nn.Module):
                 # 对混洗后的token序列进行正常的Prompt提取→Transformer编码→CLS输出
                 # 使用混洗后的tokens进行tokenizer
                 # 注意：确保梯度可以正常回传，不冻结任何参数
-                shuffled_new_tokens, shuffled_prompt_attn_weights = self.tokenizer(shuffled_tokens)
+                shuffled_prompt_tokens, shuffled_prompt_attn_weights = self.tokenizer(shuffled_tokens)
                 
-                # 使用CLS token处理混洗后的new_tokens
+                # 使用CLS token处理混洗后的prompt_tokens
                 # 确保梯度正常回传
-                shuffled_emb = self.TransformerEncoderWithCLS(shuffled_new_tokens)
+                shuffled_emb = self.TransformerEncoderWithCLS(shuffled_prompt_tokens)
                 shuffled_emb = F.normalize(shuffled_emb, p=2, dim=-1)
                 
                 # 将混洗后的嵌入作为伪异常样本
@@ -528,10 +528,10 @@ class PromptGAD(nn.Module):
                     base_tokens = base_tokens + noise
                     
                     # 对扰动后的tokens进行正常的Prompt提取→Transformer编码→CLS输出
-                    shuffled_new_tokens, shuffled_prompt_attn_weights = self.tokenizer(base_tokens)
+                    shuffled_prompt_tokens, shuffled_prompt_attn_weights = self.tokenizer(base_tokens)
                     
-                    # 使用CLS token处理扰动后的new_tokens
-                    shuffled_emb = self.TransformerEncoderWithCLS(shuffled_new_tokens)
+                    # 使用CLS token处理扰动后的prompt_tokens
+                    shuffled_emb = self.TransformerEncoderWithCLS(shuffled_prompt_tokens)
                     shuffled_emb = F.normalize(shuffled_emb, p=2, dim=-1)
                     
                     # 将扰动后的嵌入作为伪异常样本
@@ -542,8 +542,8 @@ class PromptGAD(nn.Module):
 
             # ===========================================================
 
-            # 计算重构损失：目标是 new_tokens
-            loss_rec = self.compute_rec_loss(new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx)
+            # 计算重构损失：目标是 prompt_tokens
+            loss_rec = self.compute_rec_loss(prompt_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx)
 
             # 使用原始正常节点嵌入和生成的伪异常嵌入进行对比学习
             emb_combine = torch.cat((emb[:, normal_for_train_idx, :], torch.unsqueeze(outlier_emb, 0)), 1)
@@ -555,7 +555,7 @@ class PromptGAD(nn.Module):
         else:
             # 在非训练模式下也计算重构误差向量（用于诊断）
             reconstructed_tokens = self.token_decoder(emb).squeeze(0)
-            target_tokens = new_tokens.view(-1, self.num_prompts * self.n_in)
+            target_tokens = prompt_tokens.view(-1, self.num_prompts * self.n_in)
             reconstruction_error = reconstructed_tokens - target_tokens
             # Project reconstruction error to n_in dimension for all nodes
             reconstruction_error_proj = self.reconstruction_proj(reconstruction_error)
@@ -569,25 +569,25 @@ class PromptGAD(nn.Module):
         emb = emb.clone()
 
         # 返回正交损失、重构误差向量、均匀性损失以及用于诊断的原始和重构 tokens
-        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj, uniformity_loss, original_new_tokens, reconstructed_tokens
+        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj, uniformity_loss, original_prompt_tokens, reconstructed_tokens
 
-    def compute_rec_loss(self, new_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx):
+    def compute_rec_loss(self, prompt_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx):
         """
         计算 Token 空间的重构损失
-        重构目标是 new_tokens (Prompt Token 提取的频域视角)
+        重构目标是 prompt_tokens (Prompt Token 提取的频域视角)
         使用 MSE 损失：基于重构前后的绝对值差异
         
         Args:
-            new_tokens: Prompt Token 提取的新视角 Token [N, M, n_in]
+            prompt_tokens: Prompt Token 提取的新视角 Token [N, M, n_in]
             reconstructed_tokens: 经过解码器重构的 Token 序列 [N, M * n_in]
             normal_for_generation_emb: 正常节点的嵌入
             normal_for_generation_idx: 用于生成异常的正常节点索引
         Returns:
             loss_rec: 重构损失值
         """
-        # 计算重构损失：目标是 new_tokens
-        # new_tokens: [N, M, n_in] -> flatten: [N, M * n_in]
-        target_tokens = new_tokens.view(-1, self.num_prompts * self.n_in)
+        # 计算重构损失：目标是 prompt_tokens
+        # prompt_tokens: [N, M, n_in] -> flatten: [N, M * n_in]
+        target_tokens = prompt_tokens.view(-1, self.num_prompts * self.n_in)
         
         # MSE 损失：基于绝对值差异
         # 计算每个样本的均方误差并平均

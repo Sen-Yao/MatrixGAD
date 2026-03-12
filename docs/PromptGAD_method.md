@@ -68,7 +68,7 @@ where $\odot$ denotes element-wise multiplication.
 
 Using the synthesized attention weights, we extract new frequency-domain tokens:
 $$
-\text{new_tokens} = \text{attn_weights} \cdot \mathbf{V}
+\text{prompt_tokens} = \text{attn_weights} \cdot \mathbf{V}
 $$
 
 where $\mathbf{V} = \mathcal{T}_i$ (without projection), and we apply LayerNorm to the extracted tokens.
