@@ -61,10 +61,11 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     # First pass: collect embeddings from the single batch
     t0 = time.time()
     with torch.no_grad():
-        emb, _, _, _, _, _, _, _, _, _, _, _ = model(
+        emb, _, logits, _, _, _, _, _, _, _, _, _ = model(
             concated_input_features, None, None, None, False, args
         )
         concatenated_embs = emb.squeeze(0)
+        concatenated_logits = logits.squeeze(0) if logits is not None else None
         concatenated_global_indices = batch_global_indices
     timing['first_model_forward'] = time.time() - t0
     
@@ -101,12 +102,13 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
                         all_outlier_embs.append(outlier_emb)
     timing['second_model_forward'] = time.time() - t0
     
-    # Get test set embeddings (on GPU) - note: we might not have test nodes in our single batch
+    # Get test set embeddings and logits (on GPU) - note: we might not have test nodes in our single batch
     t0 = time.time()
     
     idx_test_dev = torch.tensor(idx_test, device=device)
     test_mask = torch.isin(concatenated_global_indices, idx_test_dev) if concatenated_global_indices is not None else torch.ones(len(concatenated_embs), dtype=torch.bool, device=device)
     test_embs = concatenated_embs[test_mask]
+    test_logits = concatenated_logits[test_mask] if concatenated_logits is not None else None
     
     # Get test labels (on CPU for numpy operations)
     test_labels = ano_label
@@ -125,14 +127,18 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
             # Map back to original positions
             test_indices_in_array = sorted_indices[positions_in_sorted]
             test_labels = ano_label[test_indices_in_array]
-            # Filter test_embs to only include valid test nodes
+            # Filter test_embs and test_logits to only include valid test nodes
             test_embs = test_embs[torch.tensor(valid_mask, device=device)]
+            if test_logits is not None:
+                test_logits = test_logits[torch.tensor(valid_mask, device=device)]
         else:
             test_labels = np.array([])
             test_embs = torch.tensor([], device=device)
+            test_logits = torch.tensor([], device=device) if test_logits is not None else None
     else:
         test_labels = np.array([])
         test_embs = torch.tensor([], device=device)
+        test_logits = torch.tensor([], device=device) if test_logits is not None else None
     
     norm_mask_test = (test_labels == 0) if len(test_labels) > 0 else np.array([])
     abnorm_mask_test = (test_labels == 1) if len(test_labels) > 0 else np.array([])
@@ -140,6 +146,10 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     # Move masks back to GPU for embedding indexing
     norm_embs = test_embs[torch.tensor(norm_mask_test, dtype=torch.bool, device=device)] if len(norm_mask_test) > 0 else torch.tensor([], device=device)
     abnorm_embs = test_embs[torch.tensor(abnorm_mask_test, dtype=torch.bool, device=device)] if len(abnorm_mask_test) > 0 else torch.tensor([], device=device)
+    
+    # Get logits for normal and abnormal nodes
+    norm_logits = test_logits[torch.tensor(norm_mask_test, dtype=torch.bool, device=device)] if (test_logits is not None and len(norm_mask_test) > 0) else torch.tensor([], device=device)
+    abnorm_logits = test_logits[torch.tensor(abnorm_mask_test, dtype=torch.bool, device=device)] if (test_logits is not None and len(abnorm_mask_test) > 0) else torch.tensor([], device=device)
     
     # Use model-generated pseudo-anomalies if available, otherwise fallback
     if len(all_norm_embs) > 0 and len(all_outlier_embs) > 0:
@@ -155,11 +165,23 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     t0 = time.time()
     diagnostics = {}
     
-    # Logit metrics (set to nan for simplicity)
-    diagnostics['logit_margin'] = float('nan')
-    diagnostics['logit_std'] = float('nan')
-    diagnostics['norm_logits_mean'] = float('nan')
-    diagnostics['abnorm_logits_mean'] = float('nan')
+    # Logit metrics - compute from actual logits
+    if norm_logits.size(0) > 0 and abnorm_logits.size(0) > 0:
+        diagnostics['norm_logits_mean'] = norm_logits.mean().item()
+        diagnostics['abnorm_logits_mean'] = abnorm_logits.mean().item()
+        diagnostics['logit_margin'] = diagnostics['abnorm_logits_mean'] - diagnostics['norm_logits_mean']
+        
+        # Compute std for all test logits
+        all_test_logits = torch.cat([norm_logits, abnorm_logits], dim=0)
+        diagnostics['logit_std'] = all_test_logits.std().item() if all_test_logits.size(0) > 1 else 0.0
+    else:
+        diagnostics['norm_logits_mean'] = float('nan')
+        diagnostics['abnorm_logits_mean'] = float('nan')
+        diagnostics['logit_margin'] = float('nan')
+        diagnostics['logit_std'] = float('nan')
+    
+    # Outlier logits metrics - compute from outlier embeddings if we have a way to get logits
+    # For now, set to nan since we don't have outlier logits from this batch
     diagnostics['outlier_logits_mean'] = float('nan')
     diagnostics['outlier_logits_std'] = float('nan')
     diagnostics['outlier_logits_max'] = float('nan')
