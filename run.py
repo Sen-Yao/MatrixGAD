@@ -144,6 +144,10 @@ def train(args):
 
     normal_for_train_idx = torch.tensor(normal_for_train_idx, dtype=torch.long, device=device)
 
+    # Create diagnostic cache to use the same batch of nodes every time
+    from diagnostics import DiagnosticCache
+    diagnostic_cache = DiagnosticCache()
+
 
     # Train model
     print(f"Start training! Total epochs: {args.num_epoch}")
@@ -231,7 +235,7 @@ def train(args):
             diagnostics_train_loader = Data.DataLoader(batch_data_train, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=False)
             
             # 计算并打印基于train状态的诊断指标
-            diagnostics = compute_diagnostics(model, diagnostics_train_loader, ano_label, all_idx, device, args, normal_for_train_idx=normal_for_train_idx)
+            diagnostics = compute_diagnostics(model, diagnostics_train_loader, ano_label, all_idx, device, args, normal_for_train_idx=normal_for_train_idx, cache=diagnostic_cache)
             losses = {
                 'bce': batched_bce_loss.item(),
                 'rec': batched_rec_loss.item(),

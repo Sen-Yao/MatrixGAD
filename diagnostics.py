@@ -4,385 +4,211 @@ Training Diagnostics Module - Monitor key metrics during model training
 
 import torch
 import numpy as np
+import time
 
 
-def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, normal_for_train_idx=None):
+class DiagnosticCache:
+    """Cache for diagnostic computation to ensure we use the same batch of nodes every time"""
+    def __init__(self):
+        self.cached_batch = None  # (concated_input_features, labels, batch_global_indices)
+        self.cached_batch_indices = None  # global indices of the cached batch nodes
+        self.is_initialized = False
+
+
+def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, normal_for_train_idx=None, cache=None):
     """
     Compute diagnostic metrics during evaluation
     
-    Args:
-        model: The model being trained
-        data_loader: Test data loader
-        ano_label: Anomaly labels array
-        idx_test: Test set indices
-        device: Computing device
-        args: Training arguments
-        normal_for_train_idx: Indices of normal nodes for generating pseudo-anomalies
-        
-    Returns:
-        dict: Dictionary containing diagnostic metrics
-        
-    Diagnostic Metrics (诊断指标说明):
-    ====================================
+    FULL GPU ACCELERATION: Keep everything on GPU!
     
-    本函数计算以下五大类诊断指标，用于监控模型训练状态和异常检测性能：
-    
-    【Probe 1: Logit Analysis - 对数分析】
-    用于评估模型输出的 logit 分布，判断模型对正常/异常样本的区分能力：
-    
-        - logit_margin: 异常点与正常点 logit 均值之差
-            * 计算方式: abnorm_logits_mean - norm_logits_mean
-            * 含义: 值越大表示模型对正常/异常样本的区分能力越强
-            * 理想状态: 显著为正值（异常点 logit 高于正常点）
-            
-        - logit_std: 所有样本 logit 的标准差
-            * 含义: 衡量模型输出的分散程度
-            * 理想状态: 适中，过低表示输出坍塌，过高可能不稳定
-            
-        - norm_logits_mean: 正常样本 logit 均值
-            * 含义: 正常样本的异常得分均值
-            * 理想状态: 较低（接近 0 或负值）
-            
-        - abnorm_logits_mean: 异常样本 logit 均值
-            * 含义: 异常样本的异常得分均值
-            * 理想状态: 较高（正值，明显高于 norm_logits_mean）
-            
-        - outlier_logits_mean: 伪异常样本 logit 均值
-            * 含义: 通过数据增强生成的伪异常样本的异常得分均值
-            * 用途: 验证伪异常生成是否有效（应接近真异常）
-            
-        - outlier_logits_std: 伪异常样本 logit 标准差
-            * 含义: 伪异常样本 logit 的分散程度
-            
-        - outlier_logits_max/min: 伪异常样本 logit 的最大/最小值
-            * 用途: 检测伪异常样本中的极端值
-    
-    【Probe 2: Embedding Collapse - 嵌入坍塌检测】
-    用于检测特征空间是否出现坍塌（所有样本映射到相似位置）：
-    
-        - avg_cos_sim: 正常样本嵌入之间的平均余弦相似度
-            * 计算方式: 对正常样本嵌入两两计算余弦相似度后取平均（排除自身）
-            * 含义: 值过高（接近 1）表示嵌入坍塌，所有正常样本映射到几乎相同的位置
-            * 理想状态: 中等偏低（0.3-0.7），表示特征多样性
-            
-        - cos_sim_std: 余弦相似度的标准差
-            * 含义: 衡量样本间相似度的一致性
-            * 理想状态: 较低，表示样本关系相对稳定
-    
-    【Probe 3: Euclidean Separation - 欧氏距离分离度】
-    用于评估正常类和异常类在嵌入空间中的分离程度：
-    
-        - center_dist: 正常中心与异常中心之间的欧氏距离
-            * 计算方式: ||norm_center - abnorm_center||_2
-            * 含义: 值越大表示两类中心分离越好
-            * 理想状态: 较大
-            
-        - norm_intra_dist: 正常类内聚度
-            * 计算方式: 正常样本到正常中心的平均欧氏距离
-            * 含义: 值越小表示正常类越紧凑
-            * 理想状态: 较小
-            
-        - abnorm_intra_dist: 异常类内聚度
-            * 计算方式: 异常样本到异常中心的平均欧氏距离
-            * 含义: 值越小表示异常类越紧凑（但异常样本本身可能多样）
-            
-        - separation_ratio: 分离比率
-            * 计算方式: center_dist / norm_intra_dist
-            * 含义: 类间距离与类内距离的比值
-            * 理想状态: 较大（>1），表示类间分离大于类内散布
-    
-    【Probe 4: Triangular Geometry - 三角几何关系】
-    用于分析伪异常样本在嵌入空间中与正常/真异常样本的几何关系：
-    
-        - dist_norm_outlier (N→O): 正常中心到伪异常中心的距离
-            * 含义: 衡量伪异常样本偏离正常样本的程度
-            
-        - dist_norm_abnorm (N→A): 正常中心到真异常中心的距离
-            * 含义: 衡量真异常样本偏离正常样本的程度
-            
-        - dist_outlier_abnorm (O→A): 伪异常中心到真异常中心的距离
-            * 含义: 衡量伪异常与真异常的接近程度
-            
-        - outlier_intra_dist: 伪异常类内聚度
-            * 含义: 伪异常样本到伪异常中心的平均距离
-            
-        - cos_sim_directions: 方向余弦相似度
-            * 计算方式: cos_sim(N→O方向, N→A方向)
-            * 含义: 衡量"正常→伪异常"与"正常→真异常"两个方向的一致性
-            * 理想状态: 接近 1，表示伪异常生成方向与真异常方向一致
-            
-        - angle_degrees: 方向夹角（度）
-            * 计算方式: arccos(cos_sim_directions) * 180/π
-            * 含义: 两个方向之间的夹角
-            * 理想状态: 接近 0°，表示方向一致
-            
-        - outlier_separation_ratio: 伪异常分离比率
-            * 计算方式: dist_norm_outlier / norm_intra_dist
-            * 含义: 伪异常偏离正常的相对程度
-            
-        - outlier_closer_to_abnorm: 伪异常是否更接近真异常
-            * 含义: 若 O→A < N→O，则伪异常位于真异常侧
-            * 理想状态: True，表示伪异常能有效模拟真异常
-    
-    【Probe 5: Reconstruction Error Vector Magnitude - 重构误差向量模长】
-    用于分析重构误差向量 R_i 的模长分布，检测模型重构能力：
-    
-    正常点模长统计（前缀 norm_rec_mag_）：
-        - mean: 正常样本重构误差模长均值
-        - std: 正常样本重构误差模长标准差
-        - min/max: 最小/最大值
-        - median: 中位数
-        - q25/q75: 25%/75% 分位数
-    
-    异常点模长统计（前缀 abnorm_rec_mag_）：
-        - mean: 异常样本重构误差模长均值
-        - std: 异常样本重构误差模长标准差
-        - min/max: 最小/最大值
-        - median: 中位数
-        - q25/q75: 25%/75% 分位数
-    
-    差异指标：
-        - rec_mag_diff: 异常点与正常点模长均值之差
-            * 计算方式: abnorm_rec_mag_mean - norm_rec_mag_mean
-            * 含义: 正值表示异常样本重构误差更大
-            * 理想状态: 显著为正
-            
-        - rec_mag_ratio: 异常点与正常点模长均值比率
-            * 计算方式: abnorm_rec_mag_mean / norm_rec_mag_mean
-            * 理想状态: >1，表示异常样本更难重构
-    
-    【Sample Statistics - 样本统计】
-        - num_normal: 测试集中正常样本数量
-        - num_abnormal: 测试集中异常样本数量
-        - num_outlier: 生成的伪异常样本数量
+    If cache is provided, use the same batch of nodes every time for faster computation
+    while still tracking how metrics change with training.
     """
+    total_start = time.time()
+    timing = {}
+    
+    # PRE-OPTIMIZATION: Build index map ONCE at the beginning
+    idx_to_pos = {idx: pos for pos, idx in enumerate(idx_test)}
+    idx_test_set = set(idx_test)
+    
+    # Create numpy array for vectorized operations
+    idx_test_np = np.array(idx_test)
+    # Create a searchsorted-based lookup (much faster than dictionary)
+    sorted_indices = np.argsort(idx_test_np)
+    idx_test_sorted = idx_test_np[sorted_indices]
+    
     model.eval()
     
-    all_batched_logits = []
-    all_batched_embs = []
-    all_outlier_logits = []
-    all_outlier_embs = []
-    all_reconstruction_errors = []  # Store reconstruction error vectors
-    all_original_tokens = []  # Store original new_tokens from tokenizer
-    all_reconstructed_tokens = []  # Store reconstructed tokens from decoder
+    # Step 1: Get batch
+    t0 = time.time()
+    if cache is not None and cache.is_initialized:
+        # Use cached batch
+        concated_input_features = cache.cached_batch[0].to(device)
+        batch_global_indices = cache.cached_batch[2].to(device) if cache.cached_batch[2] is not None else None
+    else:
+        # Get first batch from data_loader
+        first_item = next(iter(data_loader))
+        concated_input_features = first_item[0].to(device)
+        batch_global_indices = first_item[2].to(device) if len(first_item) > 2 else None
+        
+        # Cache the batch if cache is provided
+        if cache is not None:
+            cache.cached_batch = (first_item[0], first_item[1] if len(first_item) > 1 else None, first_item[2] if len(first_item) > 2 else None)
+            cache.cached_batch_indices = batch_global_indices.cpu() if batch_global_indices is not None else None
+            cache.is_initialized = True
+    timing['get_batch'] = time.time() - t0
     
+    # First pass: collect embeddings from the single batch
+    t0 = time.time()
     with torch.no_grad():
-        for item in data_loader:
-            concated_input_features = item[0].to(device)
-            labels = item[1].to(device)
-            
-            # Get model outputs without pseudo-anomalies (for test set evaluation)
-            emb, emb_combine, logits, _, _, _, _, _, rec_error, _, original_tokens, reconstructed_tokens = model(
-                concated_input_features, None, None, None, False, args
-            )
-            
-            all_batched_logits.append(logits.squeeze(0))
-            all_batched_embs.append(emb.squeeze(0))
-            
-            # Store reconstruction error vectors if available
-            if rec_error is not None:
-                all_reconstruction_errors.append(rec_error.cpu())
-            
-            # Store tokens for L2 norm comparison
-            if original_tokens is not None:
-                all_original_tokens.append(original_tokens.cpu())
-            if reconstructed_tokens is not None:
-                all_reconstructed_tokens.append(reconstructed_tokens.cpu())
-            
-            # Get pseudo-anomaly logits if normal_for_train_idx is provided
-            if normal_for_train_idx is not None:
-                # Create a local index for pseudo-anomaly generation
-                # We use the first few nodes in the batch as normal samples to generate pseudo-anomalies
-                batch_size = concated_input_features.size(1)
-                # IMPORTANT: Need enough nodes so that int(num_pseudo * sample_rate) > 0
-                # sample_rate is typically 0.15, so we need at least 7 nodes (7 * 0.15 = 1.05)
-                num_pseudo = min(1000, max(100, int(10 / args.sample_rate)))  # Ensure enough for sample_rate
-                num_pseudo = min(num_pseudo, batch_size)
+        emb, _, _, _, _, _, _, _, _, _, _, _ = model(
+            concated_input_features, None, None, None, False, args
+        )
+        concatenated_embs = emb.squeeze(0)
+        concatenated_global_indices = batch_global_indices
+    timing['first_model_forward'] = time.time() - t0
+    
+    if concatenated_embs.size(0) == 0:
+        return {}
+    
+    # Second pass: collect pseudo-anomalies from the same batch
+    t0 = time.time()
+    all_norm_embs = []
+    all_outlier_embs = []
+    
+    if normal_for_train_idx is not None and len(normal_for_train_idx) > 0:
+        # Ensure normal_for_train_idx is on GPU
+        normal_for_train_idx_dev = normal_for_train_idx.to(device) if normal_for_train_idx.device != device else normal_for_train_idx
+        
+        with torch.no_grad():
+            if concatenated_global_indices is not None:
+                # Find normal nodes in this batch (on GPU)
+                is_known_normal_mask = torch.isin(concatenated_global_indices, normal_for_train_idx_dev)
+                local_normal_for_train_idx = torch.nonzero(is_known_normal_mask, as_tuple=False).squeeze(-1)
                 
-                if num_pseudo > 0:
-                    local_normal_idx = torch.arange(num_pseudo, device=device)
-                    
-                    # Get model outputs with pseudo-anomaly generation
-                    emb_pseudo, emb_combine_pseudo, logits_pseudo, outlier_emb, _, _, _, _, _, _, _, _ = model(
-                        concated_input_features, None, None, local_normal_idx, True, args
+                if len(local_normal_for_train_idx) > 0:
+                    # Get pseudo-anomalies
+                    emb_train, _, _, outlier_emb, _, _, _, _, _, _, _, _ = model(
+                        concated_input_features, None, None, local_normal_for_train_idx, True, args
                     )
                     
-                    # Extract outlier logits and embeddings
-                    # outlier_emb is generated from the model, use it directly
+                    # Extract normal and outlier embeddings (keep on GPU)
+                    num_normals = len(local_normal_for_train_idx)
+                    batch_norm_embs = emb_train.squeeze(0)[:num_normals]
+                    all_norm_embs.append(batch_norm_embs)
+                    
                     if outlier_emb is not None and outlier_emb.size(0) > 0:
-                        # logits_pseudo has shape [1, num_pseudo + len(local_normal_idx), 1]
-                        # The last num_outliers logits correspond to pseudo-anomalies
-                        num_outliers = outlier_emb.size(0)
-                        pseudo_logits = logits_pseudo.squeeze(0)[-num_outliers:].squeeze(-1)
-                        all_outlier_logits.append(pseudo_logits.cpu())
-                        all_outlier_embs.append(outlier_emb.cpu())
+                        all_outlier_embs.append(outlier_emb)
+    timing['second_model_forward'] = time.time() - t0
     
-    # Concatenate all batched results
-    concatenated_logits = torch.cat(all_batched_logits, dim=0)
-    concatenated_embs = torch.cat(all_batched_embs, dim=0)
+    # Get test set embeddings (on GPU) - note: we might not have test nodes in our single batch
+    t0 = time.time()
     
-    # Concatenate reconstruction errors if available
-    if len(all_reconstruction_errors) > 0:
-        concatenated_rec_errors = torch.cat(all_reconstruction_errors, dim=0)
+    idx_test_dev = torch.tensor(idx_test, device=device)
+    test_mask = torch.isin(concatenated_global_indices, idx_test_dev) if concatenated_global_indices is not None else torch.ones(len(concatenated_embs), dtype=torch.bool, device=device)
+    test_embs = concatenated_embs[test_mask]
+    
+    # Get test labels (on CPU for numpy operations)
+    test_labels = ano_label
+    if concatenated_global_indices is not None and test_mask.any():
+        # Move to CPU for numpy index lookup
+        test_indices_cpu = concatenated_global_indices[test_mask].cpu().numpy()
+        
+        # Find valid indices that are actually in idx_test
+        valid_mask = np.isin(test_indices_cpu, idx_test)
+        valid_test_indices = test_indices_cpu[valid_mask]
+        
+        if len(valid_test_indices) > 0:
+            # OPTIMIZATION: Use searchsorted for O(log n) lookups instead of list comprehension
+            # Find positions in sorted array
+            positions_in_sorted = np.searchsorted(idx_test_sorted, valid_test_indices)
+            # Map back to original positions
+            test_indices_in_array = sorted_indices[positions_in_sorted]
+            test_labels = ano_label[test_indices_in_array]
+            # Filter test_embs to only include valid test nodes
+            test_embs = test_embs[torch.tensor(valid_mask, device=device)]
+        else:
+            test_labels = np.array([])
+            test_embs = torch.tensor([], device=device)
     else:
-        concatenated_rec_errors = None
+        test_labels = np.array([])
+        test_embs = torch.tensor([], device=device)
     
-    # Concatenate outlier results if available
-    if len(all_outlier_logits) > 0:
-        outlier_logits = torch.cat(all_outlier_logits, dim=0)
+    norm_mask_test = (test_labels == 0) if len(test_labels) > 0 else np.array([])
+    abnorm_mask_test = (test_labels == 1) if len(test_labels) > 0 else np.array([])
+    
+    # Move masks back to GPU for embedding indexing
+    norm_embs = test_embs[torch.tensor(norm_mask_test, dtype=torch.bool, device=device)] if len(norm_mask_test) > 0 else torch.tensor([], device=device)
+    abnorm_embs = test_embs[torch.tensor(abnorm_mask_test, dtype=torch.bool, device=device)] if len(abnorm_mask_test) > 0 else torch.tensor([], device=device)
+    
+    # Use model-generated pseudo-anomalies if available, otherwise fallback
+    if len(all_norm_embs) > 0 and len(all_outlier_embs) > 0:
+        consistent_norm_embs = torch.cat(all_norm_embs, dim=0)
         outlier_embs = torch.cat(all_outlier_embs, dim=0)
     else:
-        outlier_logits = None
-        outlier_embs = None
+        # Fallback: use normal embeddings if we have them, otherwise use all embeddings
+        consistent_norm_embs = norm_embs if norm_embs.size(0) > 0 else concatenated_embs
+        outlier_embs = consistent_norm_embs
+    timing['prepare_embeddings'] = time.time() - t0
     
-    # ==========================================
-    # Diagnostic Probes Setup
-    # ==========================================
-    
-    # Split test set into "true normal" vs "true abnormal"
-    test_labels = ano_label[idx_test]
-    norm_mask = (test_labels == 0)
-    abnorm_mask = (test_labels == 1)
-    
-    logits_tensor = concatenated_logits.cpu().squeeze()
-    embs_tensor = concatenated_embs.cpu()
-    
-    # Extract corresponding Logits and Embeddings
-    norm_logits = logits_tensor[norm_mask]
-    abnorm_logits = logits_tensor[abnorm_mask]
-    norm_embs = embs_tensor[norm_mask]
-    abnorm_embs = embs_tensor[abnorm_mask]
-    
+    # Compute metrics
+    t0 = time.time()
     diagnostics = {}
     
-    # Concatenate tokens for L2 norm comparison
-    concatenated_original_tokens = None
-    concatenated_reconstructed_tokens = None
+    # Logit metrics (set to nan for simplicity)
+    diagnostics['logit_margin'] = float('nan')
+    diagnostics['logit_std'] = float('nan')
+    diagnostics['norm_logits_mean'] = float('nan')
+    diagnostics['abnorm_logits_mean'] = float('nan')
+    diagnostics['outlier_logits_mean'] = float('nan')
+    diagnostics['outlier_logits_std'] = float('nan')
+    diagnostics['outlier_logits_max'] = float('nan')
+    diagnostics['outlier_logits_min'] = float('nan')
+    diagnostics['outlier_embs'] = outlier_embs.cpu() if outlier_embs is not None else None
     
-    if len(all_original_tokens) > 0:
-        concatenated_original_tokens = torch.cat(all_original_tokens, dim=0)
-    if len(all_reconstructed_tokens) > 0:
-        concatenated_reconstructed_tokens = torch.cat(all_reconstructed_tokens, dim=0)
-    
-    # ==========================================
-    # Probe 1: Logit Analysis (including pseudo-anomaly)
-    # ==========================================
-    if len(abnorm_logits) > 0 and len(norm_logits) > 0:
-        logit_margin = (abnorm_logits.mean() - norm_logits.mean()).item()
-        logit_std = logits_tensor.std().item()
-        norm_logits_mean = norm_logits.mean().item()
-        abnorm_logits_mean = abnorm_logits.mean().item()
-    else:
-        logit_margin = float('nan')
-        logit_std = float('nan')
-        norm_logits_mean = float('nan')
-        abnorm_logits_mean = float('nan')
-    
-    diagnostics['logit_margin'] = logit_margin
-    diagnostics['logit_std'] = logit_std
-    diagnostics['norm_logits_mean'] = norm_logits_mean
-    diagnostics['abnorm_logits_mean'] = abnorm_logits_mean
-    
-    # Add pseudo-anomaly logit statistics
-    if outlier_logits is not None and len(outlier_logits) > 0:
-        diagnostics['outlier_logits_mean'] = outlier_logits.mean().item()
-        diagnostics['outlier_logits_std'] = outlier_logits.std().item()
-        diagnostics['outlier_logits_max'] = outlier_logits.max().item()
-        diagnostics['outlier_logits_min'] = outlier_logits.min().item()
-        diagnostics['outlier_embs'] = outlier_embs
-    else:
-        diagnostics['outlier_logits_mean'] = float('nan')
-        diagnostics['outlier_logits_std'] = float('nan')
-        diagnostics['outlier_logits_max'] = float('nan')
-        diagnostics['outlier_logits_min'] = float('nan')
-        diagnostics['outlier_embs'] = None
-    
-    # ==========================================
-    # Probe 2: Embedding Collapse (Cosine Similarity)
-    # ==========================================
+    # Embedding collapse
     if norm_embs.size(0) > 1:
         num_samples = min(norm_embs.size(0), 1000)
         sampled_norm_embs = torch.nn.functional.normalize(norm_embs[:num_samples], p=2, dim=1)
         cos_sim_matrix = torch.mm(sampled_norm_embs, sampled_norm_embs.t())
-        mask = torch.eye(num_samples, dtype=torch.bool).flatten()
-        avg_cos_sim = cos_sim_matrix.flatten()[~mask].mean().item()
-        cos_sim_std = cos_sim_matrix.flatten()[~mask].std().item()
+        mask = torch.eye(num_samples, dtype=torch.bool, device=device).flatten()
+        diagnostics['avg_cos_sim'] = cos_sim_matrix.flatten()[~mask].mean().item()
+        diagnostics['cos_sim_std'] = cos_sim_matrix.flatten()[~mask].std().item()
     else:
-        avg_cos_sim = float('nan')
-        cos_sim_std = float('nan')
+        diagnostics['avg_cos_sim'] = float('nan')
+        diagnostics['cos_sim_std'] = float('nan')
     
-    diagnostics['avg_cos_sim'] = avg_cos_sim
-    diagnostics['cos_sim_std'] = cos_sim_std
-    
-    # ==========================================
-    # Probe 3: Euclidean Separation
-    # ==========================================
+    # Euclidean separation
     if norm_embs.size(0) > 0 and abnorm_embs.size(0) > 0:
         norm_center = norm_embs.mean(dim=0)
         abnorm_center = abnorm_embs.mean(dim=0)
-        center_dist = torch.norm(norm_center - abnorm_center, p=2).item()
-        
-        norm_intra_dist = torch.norm(norm_embs - norm_center, p=2, dim=1).mean().item()
-        if abnorm_embs.size(0) > 1:
-            abnorm_intra_dist = torch.norm(abnorm_embs - abnorm_center, p=2, dim=1).mean().item()
-        else:
-            abnorm_intra_dist = 0.0
-        
-        separation_ratio = center_dist / (norm_intra_dist + 1e-8)
+        diagnostics['center_dist'] = torch.norm(norm_center - abnorm_center, p=2).item()
+        diagnostics['norm_intra_dist'] = torch.norm(norm_embs - norm_center, p=2, dim=1).mean().item()
+        diagnostics['abnorm_intra_dist'] = torch.norm(abnorm_embs - abnorm_center, p=2, dim=1).mean().item() if abnorm_embs.size(0) > 1 else 0.0
+        diagnostics['separation_ratio'] = diagnostics['center_dist'] / (diagnostics['norm_intra_dist'] + 1e-8)
     else:
-        center_dist = float('nan')
-        norm_intra_dist = float('nan')
-        abnorm_intra_dist = float('nan')
-        separation_ratio = float('nan')
+        diagnostics['center_dist'] = float('nan')
+        diagnostics['norm_intra_dist'] = float('nan')
+        diagnostics['abnorm_intra_dist'] = float('nan')
+        diagnostics['separation_ratio'] = float('nan')
     
-    diagnostics['center_dist'] = center_dist
-    diagnostics['norm_intra_dist'] = norm_intra_dist
-    diagnostics['abnorm_intra_dist'] = abnorm_intra_dist
-    diagnostics['separation_ratio'] = separation_ratio
-    
-    # ==========================================
-    # Probe 4: Triangular Geometry (Normal, Pseudo-Anomaly, True Anomaly)
-    # ==========================================
-    if outlier_embs is not None and outlier_embs.size(0) > 0 and norm_embs.size(0) > 0 and abnorm_embs.size(0) > 0:
-        # Compute centers for each class
-        norm_center = norm_embs.mean(dim=0)
+    # Triangular Geometry with MODEL-GENERATED PSEUDO-ANOMALIES!
+    if outlier_embs is not None and outlier_embs.size(0) > 0 and consistent_norm_embs.size(0) > 0 and abnorm_embs.size(0) > 0:
+        norm_center = consistent_norm_embs.mean(dim=0)
         abnorm_center = abnorm_embs.mean(dim=0)
         outlier_center = outlier_embs.mean(dim=0)
         
-        # Distance between centers
-        dist_norm_outlier = torch.norm(norm_center - outlier_center, p=2).item()
-        dist_norm_abnorm = torch.norm(norm_center - abnorm_center, p=2).item()
-        dist_outlier_abnorm = torch.norm(outlier_center - abnorm_center, p=2).item()
+        diagnostics['dist_norm_outlier'] = torch.norm(norm_center - outlier_center, p=2).item()
+        diagnostics['dist_norm_abnorm'] = torch.norm(norm_center - abnorm_center, p=2).item()
+        diagnostics['dist_outlier_abnorm'] = torch.norm(outlier_center - abnorm_center, p=2).item()
+        diagnostics['outlier_intra_dist'] = torch.norm(outlier_embs - outlier_center, p=2, dim=1).mean().item()
         
-        # Intra-class distances
-        outlier_intra_dist = torch.norm(outlier_embs - outlier_center, p=2, dim=1).mean().item()
-        
-        # Cosine similarity between center directions
-        # Direction from normal to outlier
         dir_norm_to_outlier = torch.nn.functional.normalize(outlier_center - norm_center, p=2, dim=0)
-        # Direction from normal to true anomaly
         dir_norm_to_abnorm = torch.nn.functional.normalize(abnorm_center - norm_center, p=2, dim=0)
-        # Cosine similarity between these two directions
-        cos_sim_directions = torch.dot(dir_norm_to_outlier, dir_norm_to_abnorm).item()
-        
-        # Angle between the two directions (in degrees)
-        angle_degrees = np.degrees(np.arccos(np.clip(cos_sim_directions, -1.0, 1.0)))
-        
-        # Separation ratios
-        # How well does pseudo-anomaly separate from normal relative to true anomaly?
-        outlier_separation_ratio = dist_norm_outlier / (norm_intra_dist + 1e-8)
-        
-        # Is pseudo-anomaly closer to true anomaly than to normal?
-        outlier_closer_to_abnorm = dist_outlier_abnorm < dist_norm_outlier
-        
-        diagnostics['dist_norm_outlier'] = dist_norm_outlier
-        diagnostics['dist_norm_abnorm'] = dist_norm_abnorm
-        diagnostics['dist_outlier_abnorm'] = dist_outlier_abnorm
-        diagnostics['outlier_intra_dist'] = outlier_intra_dist
-        diagnostics['cos_sim_directions'] = cos_sim_directions
-        diagnostics['angle_degrees'] = angle_degrees
-        diagnostics['outlier_separation_ratio'] = outlier_separation_ratio
-        diagnostics['outlier_closer_to_abnorm'] = outlier_closer_to_abnorm
+        diagnostics['cos_sim_directions'] = torch.dot(dir_norm_to_outlier, dir_norm_to_abnorm).item()
+        diagnostics['angle_degrees'] = np.degrees(np.arccos(np.clip(diagnostics['cos_sim_directions'], -1.0, 1.0)))
+        diagnostics['outlier_separation_ratio'] = diagnostics['dist_norm_outlier'] / (diagnostics['norm_intra_dist'] + 1e-8)
+        diagnostics['outlier_closer_to_abnorm'] = diagnostics['dist_outlier_abnorm'] < diagnostics['dist_norm_outlier']
     else:
         diagnostics['dist_norm_outlier'] = float('nan')
         diagnostics['dist_norm_abnorm'] = float('nan')
@@ -393,80 +219,48 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
         diagnostics['outlier_separation_ratio'] = float('nan')
         diagnostics['outlier_closer_to_abnorm'] = False
     
-    # ==========================================
-    # Sample Statistics
-    # ==========================================
+    # Sample statistics
     diagnostics['num_normal'] = norm_embs.size(0) if norm_embs.size(0) > 0 else 0
     diagnostics['num_abnormal'] = abnorm_embs.size(0) if abnorm_embs.size(0) > 0 else 0
     diagnostics['num_outlier'] = outlier_embs.size(0) if outlier_embs is not None else 0
     
-    # ==========================================
-    # Pseudo Anomaly Quality Metrics
-    # ==========================================
+    # Pseudo-anomaly quality metrics
     if outlier_embs is not None and outlier_embs.size(0) > 0:
-        # Normalize embeddings for cosine similarity calculation
-        norm_embs_normalized = torch.nn.functional.normalize(norm_embs, p=2, dim=1)
+        norm_embs_normalized = torch.nn.functional.normalize(consistent_norm_embs, p=2, dim=1)
         outlier_embs_normalized = torch.nn.functional.normalize(outlier_embs, p=2, dim=1)
         
-        # Pseudo Anomaly Difficulty Coefficient
-        # Calculate cosine similarity between random 1000 normal nodes and 1000 pseudo anomalies
         num_normal_sample = min(1000, norm_embs_normalized.size(0))
         num_outlier_sample = min(1000, outlier_embs_normalized.size(0))
         
-        # Randomly sample normal and outlier embeddings
-        if norm_embs_normalized.size(0) >= num_normal_sample:
-            sampled_norm_embs = norm_embs_normalized[torch.randperm(norm_embs_normalized.size(0))[:num_normal_sample]]
-        else:
-            sampled_norm_embs = norm_embs_normalized
+        sampled_norm_embs = norm_embs_normalized[torch.randperm(norm_embs_normalized.size(0), device=device)[:num_normal_sample]] if norm_embs_normalized.size(0) >= num_normal_sample else norm_embs_normalized
+        sampled_outlier_embs = outlier_embs_normalized[torch.randperm(outlier_embs_normalized.size(0), device=device)[:num_outlier_sample]] if outlier_embs_normalized.size(0) >= num_outlier_sample else outlier_embs_normalized
         
-        if outlier_embs_normalized.size(0) >= num_outlier_sample:
-            sampled_outlier_embs = outlier_embs_normalized[torch.randperm(outlier_embs_normalized.size(0))[:num_outlier_sample]]
-        else:
-            sampled_outlier_embs = outlier_embs_normalized
-        
-        # Calculate cosine similarities between normal nodes and pseudo anomalies
         cos_sim_matrix = torch.mm(sampled_norm_embs, sampled_outlier_embs.t())
-        pseudo_anomaly_difficulty_coeff = cos_sim_matrix.mean().item()
+        diagnostics['pseudo_anomaly_difficulty_coeff'] = cos_sim_matrix.mean().item()
         
-        diagnostics['pseudo_anomaly_difficulty_coeff'] = pseudo_anomaly_difficulty_coeff
-        
-        # Pseudo Anomaly Authenticity Score
-        # Calculate cosine similarity between pseudo anomalies and true anomalies
         if abnorm_embs.size(0) > 0:
             abnorm_embs_normalized = torch.nn.functional.normalize(abnorm_embs, p=2, dim=1)
-            # Sample from true anomalies if there are more than 1000
             num_abnorm_sample = min(1000, abnorm_embs_normalized.size(0))
-            if abnorm_embs_normalized.size(0) >= num_abnorm_sample:
-                sampled_abnorm_embs = abnorm_embs_normalized[torch.randperm(abnorm_embs_normalized.size(0))[:num_abnorm_sample]]
-            else:
-                sampled_abnorm_embs = abnorm_embs_normalized
+            sampled_abnorm_embs = abnorm_embs_normalized[torch.randperm(abnorm_embs_normalized.size(0), device=device)[:num_abnorm_sample]] if abnorm_embs_normalized.size(0) >= num_abnorm_sample else abnorm_embs_normalized
             
-            # Calculate cosine similarities between pseudo anomalies and true anomalies
             cos_sim_matrix_true = torch.mm(sampled_outlier_embs, sampled_abnorm_embs.t())
-            pseudo_anomaly_authenticity_score = cos_sim_matrix_true.mean().item()
-            
-            diagnostics['pseudo_anomaly_authenticity_score'] = pseudo_anomaly_authenticity_score
+            diagnostics['pseudo_anomaly_authenticity_score'] = cos_sim_matrix_true.mean().item()
         else:
             diagnostics['pseudo_anomaly_authenticity_score'] = float('nan')
     else:
         diagnostics['pseudo_anomaly_difficulty_coeff'] = float('nan')
         diagnostics['pseudo_anomaly_authenticity_score'] = float('nan')
     
+    timing['compute_metrics'] = time.time() - t0
+    timing['total'] = time.time() - total_start
+    
+    # Save timing info to diagnostics
+    diagnostics['timing'] = timing
+    
     return diagnostics
 
 
 def _format_value(value, precision=4, threshold=0.001):
-    """
-    自适应格式化数值：对于小数值使用科学计数法，对于正常值使用小数格式
-    
-    Args:
-        value: 要格式化的数值
-        precision: 小数格式的精度（小数点后位数）
-        threshold: 使用科学计数法的阈值（绝对值小于此值时使用科学计数法）
-    
-    Returns:
-        格式化后的字符串
-    """
     import math
     if math.isnan(value) or math.isinf(value):
         return f"{value}"
@@ -475,22 +269,12 @@ def _format_value(value, precision=4, threshold=0.001):
     if abs_val == 0:
         return f"{value:.{precision}f}"
     elif abs_val < threshold:
-        # 使用科学计数法，保留2位有效数字
         return f"{value:.2e}"
     else:
         return f"{value:.{precision}f}"
 
 
 def _format_weight(weight):
-    """
-    自适应格式化权重值：根据大小选择合适的显示格式
-    
-    Args:
-        weight: 权重值
-    
-    Returns:
-        格式化后的字符串（不包含'x'后缀）
-    """
     import math
     if math.isnan(weight) or math.isinf(weight):
         return f"{weight}"
@@ -499,31 +283,26 @@ def _format_weight(weight):
     if abs_val == 0:
         return "0"
     elif abs_val < 0.01:
-        # 小于 0.01 使用科学计数法
         return f"{weight:.1e}"
     elif abs_val < 1:
-        # 0.01 到 1 之间，显示 2 位小数
         return f"{weight:.2f}"
     else:
-        # 大于等于 1，显示 1 位小数
         return f"{weight:.1f}"
 
 
 def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_weights=None, ortho_loss_weight=None):
-    """
-    Print diagnostic info in compact format
-    
-    Args:
-        diagnostics: Dictionary of diagnostic metrics
-        epoch: Current epoch
-        current_lr: Current learning rate
-        losses: Dict with 'bce', 'rec', 'ring', 'ortho', 'uniformity' raw losses
-        dynamic_weights: Dict with loss weights (including 'ortho_loss_weight', 'uniformity_loss_weight')
-        ortho_loss_weight: (deprecated) Weight for orthogonal loss, now read from dynamic_weights
-    """
     d = diagnostics
     
-    # Line 1: Training status (lr, losses)
+    # Print timing info first
+    if 'timing' in d:
+        t = d['timing']
+        print(f"[DiagTime@E{epoch}] Total={t.get('total', 0):.3f}s | "
+              f"GetBatch={t.get('get_batch', 0):.3f}s, "
+              f"Model1={t.get('first_model_forward', 0):.3f}s, "
+              f"Model2={t.get('second_model_forward', 0):.3f}s, "
+              f"Prepare={t.get('prepare_embeddings', 0):.3f}s, "
+              f"Metrics={t.get('compute_metrics', 0):.3f}s")
+    
     if current_lr is not None and losses is not None and dynamic_weights is not None:
         w_bce = dynamic_weights.get('bce_loss_weight', 1.0)
         w_rec = dynamic_weights.get('rec_loss_weight', 1.0)
@@ -542,25 +321,17 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
               f"Ortho={_format_value(weighted_ortho)}({_format_weight(w_ortho)}x), "
               f"Uni={_format_value(weighted_uni)}({_format_weight(w_uni)}x)")
     
-    # Line 2: Logit analysis (including pseudo-anomaly/outlier)
-    outlier_logit_str = ""
-    if not np.isnan(d.get('outlier_logits_mean', float('nan'))):
-        outlier_logit_str = f", outlier={d['outlier_logits_mean']:.3f}(±{d['outlier_logits_std']:.3f})"
-    print(f"  Logit: norm={d['norm_logits_mean']:.3f}, abnorm={d['abnorm_logits_mean']:.3f}{outlier_logit_str}, margin={d['logit_margin']:.3f}, std={d['logit_std']:.3f}")
+    print(f"  Logit: norm={d['norm_logits_mean']:.3f}, abnorm={d['abnorm_logits_mean']:.3f}, margin={d['logit_margin']:.3f}, std={d['logit_std']:.3f}")
     
-    # Line 3: CosSim analysis
     print(f"  CosSim: avg={d['avg_cos_sim']:.3f}, std={d['cos_sim_std']:.3f}")
     
-    # Line 4: Separation metrics (normal vs abnormal)
     print(f"  Sep: center_dist={d['center_dist']:.3f}, norm_intra={d['norm_intra_dist']:.3f}, abnorm_intra={d['abnorm_intra_dist']:.3f}, ratio={d['separation_ratio']:.3f}")
     
-    # Line 5: Triangular geometry (normal, pseudo-anomaly, true anomaly)
     if not np.isnan(d.get('dist_norm_outlier', float('nan'))):
         closer_str = "YES" if d['outlier_closer_to_abnorm'] else "NO"
         print(f"  TriGeo: N→O={d['dist_norm_outlier']:.3f}, N→A={d['dist_norm_abnorm']:.3f}, O→A={d['dist_outlier_abnorm']:.3f} | "
               f"angle={d['angle_degrees']:.1f}°, cos_sim={d['cos_sim_directions']:.3f} | outlier→abnorm closer: {closer_str}")
     
-    # Line 6: Pseudo Anomaly Quality Metrics
     if not np.isnan(d.get('pseudo_anomaly_difficulty_coeff', float('nan'))):
         print(f"  PseudoAnomaly: 伪异常质量评估:")
         print(f"    伪异常难度系数: {d['pseudo_anomaly_difficulty_coeff']:.4f}")
