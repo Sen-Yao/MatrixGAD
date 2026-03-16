@@ -58,12 +58,22 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
             cache.is_initialized = True
     timing['get_batch'] = time.time() - t0
     
-    # First pass: collect embeddings from the single batch
+    # First pass: collect embeddings and attention weights from the single batch
     t0 = time.time()
     with torch.no_grad():
-        emb, _, logits, _, _, _, _, _, _, _, _, _ = model(
-            concated_input_features, None, None, None, False, args
-        )
+        # 检查模型是否支持返回注意力权重
+        try:
+            # 尝试获取注意力权重
+            emb, _, logits, _, _, _, _, _, _, _, _, _, prompt_attn_weights = model(
+                concated_input_features, None, None, None, False, args, return_attn_weights=True
+            )
+        except:
+            # 如果不支持，使用普通方式
+            emb, _, logits, _, _, _, _, _, _, _, _, _ = model(
+                concated_input_features, None, None, None, False, args
+            )
+            prompt_attn_weights = None
+        
         concatenated_embs = emb.squeeze(0)
         concatenated_logits = logits.squeeze(0) if logits is not None else None
         concatenated_global_indices = batch_global_indices
@@ -246,6 +256,9 @@ def compute_diagnostics(model, data_loader, ano_label, idx_test, device, args, n
     diagnostics['num_abnormal'] = abnorm_embs.size(0) if abnorm_embs.size(0) > 0 else 0
     diagnostics['num_outlier'] = outlier_embs.size(0) if outlier_embs is not None else 0
     
+    # 保存注意力权重用于打印
+    diagnostics['prompt_attn_weights'] = prompt_attn_weights
+    
     # Pseudo-anomaly quality metrics
     if outlier_embs is not None and outlier_embs.size(0) > 0:
         norm_embs_normalized = torch.nn.functional.normalize(consistent_norm_embs, p=2, dim=1)
@@ -359,3 +372,50 @@ def print_diagnostics(diagnostics, epoch, current_lr=None, losses=None, dynamic_
         print(f"    伪异常难度系数: {d['pseudo_anomaly_difficulty_coeff']:.4f}")
         if not np.isnan(d.get('pseudo_anomaly_authenticity_score', float('nan'))):
             print(f"    伪异常真实性分数: {d['pseudo_anomaly_authenticity_score']:.4f}")
+    
+    # 打印注意力权重矩阵
+    # if 'prompt_attn_weights' in d and d['prompt_attn_weights'] is not None:
+        # print_attention_weights(d['prompt_attn_weights'], epoch)
+
+
+def print_attention_weights(attn_weights, epoch):
+    """
+    打印注意力权重矩阵，形状为 [batch_size, num_prompts, num_hops]
+    """
+    print(f"\n=== 注意力权重矩阵 (Epoch {epoch}) ===")
+    
+    # 将 tensor 移动到 CPU
+    attn_weights_cpu = attn_weights.cpu().numpy()
+    
+    batch_size, num_prompts, num_hops = attn_weights_cpu.shape
+    
+    print(f"形状: batch={batch_size}, num_prompts={num_prompts}, num_hops={num_hops}")
+    print(f"\n前3个样本的注意力权重矩阵:")
+    
+    # 只打印前几个样本以避免输出过多
+    num_samples_to_print = min(3, batch_size)
+    
+    for sample_idx in range(num_samples_to_print):
+        print(f"\n--- 样本 {sample_idx} ---")
+        print(f"{'Prompt':>8}", end="")
+        for hop_idx in range(num_hops):
+            print(f"  Hop{hop_idx:>3}", end="")
+        print()
+        
+        for prompt_idx in range(num_prompts):
+            print(f"P{prompt_idx:>5}:", end="")
+            for hop_idx in range(num_hops):
+                weight = attn_weights_cpu[sample_idx, prompt_idx, hop_idx]
+                # 格式化输出
+                if abs(weight) < 0.001:
+                    print(f" {weight:+.1e}", end="")
+                else:
+                    print(f" {weight:+.4f}", end="")
+            print()
+    
+    # 打印统计信息
+    print(f"\n--- 统计信息 ---")
+    print(f"平均注意力权重: {np.mean(attn_weights_cpu):.6f}")
+    print(f"注意力权重标准差: {np.std(attn_weights_cpu):.6f}")
+    print(f"最大注意力权重: {np.max(attn_weights_cpu):.6f}")
+    print(f"最小注意力权重: {np.min(attn_weights_cpu):.6f}")

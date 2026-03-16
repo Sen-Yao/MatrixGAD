@@ -463,7 +463,11 @@ class PromptGAD(nn.Module):
         # 调整形状为 [1, batch_size, n_in]
         return cls_output.unsqueeze(0)
 
-    def forward(self, input_tokens, adj, _, normal_for_train_idx, train_flag, args, sparse=False):
+    def forward(self, input_tokens, adj, _, normal_for_train_idx, train_flag, args, sparse=False, return_attn_weights=False):
+        """
+        Args:
+            return_attn_weights: 如果为 True，则额外返回注意力权重用于诊断
+        """
 
         # input_tokens: (N, args.pp_k+1, d)
 
@@ -592,7 +596,10 @@ class PromptGAD(nn.Module):
         emb = emb.clone()
 
         # 返回正交损失、重构误差向量、均匀性损失以及用于诊断的原始和重构 tokens
-        return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj, uniformity_loss, original_prompt_tokens, reconstructed_tokens
+        if return_attn_weights:
+            return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj, uniformity_loss, original_prompt_tokens, reconstructed_tokens, prompt_attn_weights
+        else:
+            return emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, reconstruction_error_proj, uniformity_loss, original_prompt_tokens, reconstructed_tokens
 
     def compute_rec_loss(self, prompt_tokens, reconstructed_tokens, normal_for_generation_emb, normal_for_generation_idx):
         """
