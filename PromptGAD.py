@@ -242,7 +242,7 @@ class PromptGAD(nn.Module):
         # 将模型移动到指定设备
         self.to(self.device)
 
-    def tokenizer(self, raw_tokens, tokenizer_temp=None):
+    def tokenizer(self, raw_tokens, tokenizer_temp=None, partial_temp=None):
         """
         使用可学习的 Prompt Token 对原始 tokens 进行交叉注意力查询，
         提取 M 种不同的"频域视角"特征。
@@ -251,6 +251,8 @@ class PromptGAD(nn.Module):
             raw_tokens: 原 NAGphormer 特征 [Batch, num_hops, d_model]
                         注意：这里的 d_model 是 n_in (输入特征维度)
             tokenizer_temp: 温度参数，默认为 self.args.tokenizer_temp
+            partial_temp: 如果不为 None，则只对前 pp_k // 2 个 token 使用此温度，
+                         后面的 token 使用 tokenizer_temp。这样可以实现部分升温。
 
         Returns:
             prompt_tokens: 提取的新视角 Token [Batch, M, n_in]
@@ -263,6 +265,7 @@ class PromptGAD(nn.Module):
         B = raw_tokens.size(0)
         M = self.num_prompts
         d_model = self.n_in  # 使用 n_in 而不是 args.embedding_dim
+        num_hops = raw_tokens.size(1)  # num_hops = pp_k + 1
 
         # 扩展 Prompt 匹配 Batch Size
         Q = self.prompts.expand(B, -1, -1)  # [B, M, n_in]
@@ -272,12 +275,41 @@ class PromptGAD(nn.Module):
         # 1. 计算重要性 (Magnitude) - 传统的 Softmax
         # score: [B, M, num_hops]
         score_mag = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(d_model)
-        magnitude = F.softmax(score_mag / tokenizer_temp, dim=-1)
-
+        
         # 2. 计算方向/突变 (Sign) - 打破低通滤波诅咒的关键！
         # range: [-1, 1]
         score_sign = torch.matmul(self.sign_q(Q), self.sign_k(K).transpose(-1, -2))
-        sign = torch.tanh(score_sign / tokenizer_temp)
+        
+        # ========== 原来的逻辑 (先注释保留) ==========
+        # magnitude = F.softmax(score_mag / tokenizer_temp, dim=-1)
+        # sign = torch.tanh(score_sign / tokenizer_temp)
+        # ===========================================
+        
+        # ========== 新逻辑：支持部分升温 ==========
+        if partial_temp is not None:
+            # 只对前 pp_k // 2 个 token 使用高温，后面的使用正常温度
+            # 注意：num_hops = pp_k + 1，所以 pp_k = num_hops - 1
+            pp_k = num_hops - 1
+            partial_idx = pp_k // 2  # 前 pp_k // 2 个 token（不包括 0-hop？或者包括？按照任务描述是前 pp_k // 2 个）
+            
+            # 创建温度掩码：前 partial_idx + 1 个位置（包括 0-hop）使用 partial_temp，后面的使用 tokenizer_temp
+            # 或者按照任务描述：仅升温前 pp_k // 2 个 token（可能是指 hop 1 到 hop pp_k//2）
+            # 这里按照任务描述：前 pp_k // 2 个 token（从 1-hop 开始算）
+            temp_mask = torch.ones(B, M, num_hops, device=raw_tokens.device) * tokenizer_temp
+            
+            # 前 partial_idx 个 hop（1-hop 到 partial_idx-hop）使用高温
+            # 注意：索引 0 是 0-hop，索引 1 是 1-hop，...，索引 pp_k 是 pp_k-hop
+            if partial_idx > 0:
+                temp_mask[:, :, 1:partial_idx+1] = partial_temp
+            
+            # 应用不同的温度
+            magnitude = F.softmax(score_mag / temp_mask, dim=-1)
+            sign = torch.tanh(score_sign / temp_mask)
+        else:
+            # 原来的逻辑：所有 token 使用相同温度
+            magnitude = F.softmax(score_mag / tokenizer_temp, dim=-1)
+            sign = torch.tanh(score_sign / tokenizer_temp)
+        # ===========================================
 
         # 3. 合成动态滤波器权重
         attn_weights = magnitude * sign  # [B, M, num_hops]
@@ -492,18 +524,37 @@ class PromptGAD(nn.Module):
             hallucinated_temp = getattr(self.args, 'tokenizer_temp', 1.0) * getattr(self.args, 'tokenizer_hallucination_ratio', 2.0)
             normal_temp = getattr(self.args, 'tokenizer_temp', 1.0)
 
-            # 使用正常温度和高温分别处理tokens，并添加detach()防止梯度回传到tokenizer和prompts
+            # ========== 原来的逻辑 (先注释保留) ==========
+            # # 使用正常温度和高温分别处理tokens，并添加detach()防止梯度回传到tokenizer和prompts
+            # normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
+            # normal_prompt_tokens = normal_prompt_tokens.detach()
+            # hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, hallucinated_temp)
+            # hallucinated_prompt_tokens = hallucinated_prompt_tokens.detach()
+            # 
+            # # 创建随机mask，决定哪些prompt使用高温
+            # B, M, d_model = normal_prompt_tokens.shape
+            # mask = torch.rand(B, M, device=batch_normal_tokens_for_generation.device) < getattr(self.args, 'hallucination_prompt_ratio', 0.2)
+            # 
+            # # 根据mask混合正常和高温处理的prompt
+            # mixed_prompt_tokens = torch.where(mask.unsqueeze(-1), hallucinated_prompt_tokens, normal_prompt_tokens)
+            # ===========================================
+            
+            # ========== 新逻辑：仅对前 pp_k // 2 个 token 进行升温 ==========
+            # 使用正常温度处理所有tokens
             normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
             normal_prompt_tokens = normal_prompt_tokens.detach()
-            hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, hallucinated_temp)
+            
+            # 使用部分升温：前 pp_k // 2 个 token 使用高温，后面的使用正常温度
+            hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp, partial_temp=hallucinated_temp)
             hallucinated_prompt_tokens = hallucinated_prompt_tokens.detach()
-
-            # 创建随机mask，决定哪些prompt使用高温
+            
+            # 创建随机mask，决定哪些prompt使用部分升温
             B, M, d_model = normal_prompt_tokens.shape
             mask = torch.rand(B, M, device=batch_normal_tokens_for_generation.device) < getattr(self.args, 'hallucination_prompt_ratio', 0.2)
-
-            # 根据mask混合正常和高温处理的prompt
+            
+            # 根据mask混合正常和部分升温处理的prompt
             mixed_prompt_tokens = torch.where(mask.unsqueeze(-1), hallucinated_prompt_tokens, normal_prompt_tokens)
+            # ===========================================
 
             # 使用CLS token处理混合后的prompt_tokens作为伪异常
             hallucinated_emb = self.TransformerEncoderWithCLS(mixed_prompt_tokens)

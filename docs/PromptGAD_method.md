@@ -124,15 +124,39 @@ where $\text{target_tokens}$ are the flattened original frequency-domain tokens.
 
 Instead of using reconstruction errors, we generate pseudo-anomalies using a partial temperature hallucination approach:
 
-For each normal node selected for pseudo-anomaly generation, we randomly apply an increased temperature parameter to only a subset of prompts during the tokenizer process. The process is as follows:
+For each normal node selected for pseudo-anomaly generation, we randomly apply an increased temperature parameter to only a subset of prompts during the tokenizer process. **Importantly, the temperature elevation is only applied to the first `pp_k // 2` tokens (hops), while the later tokens use the normal temperature.** The process is as follows:
 
 1. Select a subset of normal nodes for pseudo-anomaly generation based on the sample rate
 2. For these selected nodes, randomly determine which prompts will use elevated temperature based on the hallucination_prompt_ratio hyperparameter
-3. Apply normal temperature to some prompts and elevated temperature to others: $\tau_{\text{hallucinated}} = \tau \times \text{hallucination\_ratio}$, where $\tau$ is the standard tokenizer temperature and $\text{hallucination\_ratio}$ is the hallucination multiplier hyperparameter
-4. Process the normal tokens through the tokenizer with mixed temperatures: normal tokens → Prompt extraction (with mixed temperatures for different prompts) → Transformer encoding → CLS output, generating pseudo-anomaly samples
+3. Apply partial temperature elevation: for selected prompts, use elevated temperature $\tau_{\text{hallucinated}} = \tau \times \text{hallucination\_ratio}$ only for the first `pp_k // 2` tokens, while using normal temperature $\tau$ for all other tokens; for non-selected prompts, use normal temperature $\tau$ for all tokens
+4. Process the normal tokens through the tokenizer with mixed temperatures: normal tokens → Prompt extraction (with partial temperature elevation for selected prompts) → Transformer encoding → CLS output, generating pseudo-anomaly samples
 5. Compute the binary cross-entropy loss between normal node representations and the generated pseudo-anomaly representations
 
-This approach creates meaningful yet artificial anomalies by selectively increasing the randomness and uncertainty in the token extraction process for certain frequency-domain perspectives, which helps the model better distinguish between normal and truly anomalous patterns. The partial temperature elevation encourages the model to explore more diverse frequency-domain perspectives for specific prompts while maintaining stability in others, leading to pseudo-anomalies that are distinct from normal patterns. The gradients flow back through the entire pipeline, ensuring that the Prompt tokens and Transformer parameters learn to differentiate between normal and pseudo-anomalous patterns effectively.
+This approach creates meaningful yet artificial anomalies by selectively increasing the randomness and uncertainty in the token extraction process for certain frequency-domain perspectives, particularly focusing on the earlier hops (first `pp_k // 2` tokens). By only elevating temperature for the earlier hops, we maintain more stable representations for the later hops while still introducing sufficient diversity in the pseudo-anomaly generation. The partial temperature elevation encourages the model to explore more diverse frequency-domain perspectives for specific prompts while maintaining stability in others, leading to pseudo-anomalies that are distinct from normal patterns.
+
+### 4.2.1 Gradient Flow Control with Detach()
+
+To ensure proper gradient flow separation during pseudo-anomaly generation, we apply `.detach()` to the tokenizer outputs when generating pseudo-anomalies. This design decision has important implications for the training dynamics:
+
+**Implementation Details:**
+- When generating pseudo-anomalies, both `normal_prompt_tokens` and `hallucinated_prompt_tokens` are detached from the computation graph immediately after being produced by the tokenizer
+- This detachment prevents gradients from the BCE loss from flowing back to the prompt tokens and tokenizer parameters
+- The mixed `prompt_tokens` (combining normal and hallucinated tokens) are also in a detached state when passed to the Transformer encoder
+
+**Gradient Flow Architecture:**
+- **BCE Loss Gradients:** Only flow through the Transformer encoder and classification head (fc1, fc2, fc3 layers)
+- **Prompt & Tokenizer Gradients:** Only updated through other loss components:
+  - Reconstruction loss (`loss_rec`)
+  - Orthogonality loss (`ortho_loss`)
+  - Uniformity loss (`uniformity_loss`)
+
+**Benefits of this Approach:**
+1. **Clear Separation of Responsibilities:** The BCE loss focuses on teaching the encoder and classifier to distinguish patterns, while the prompt learning is guided by reconstruction and orthogonality objectives
+2. **Stable Training:** Prevents potential conflicting gradients that could arise from having pseudo-anomaly generation influence the same prompt tokens used for normal pattern encoding
+3. **Modular Optimization:** Allows each component to learn specialized representations without interference from the pseudo-anomaly generation process
+4. **Consistent Prompt Behavior:** Ensures that prompt tokens maintain stable behavior for encoding normal patterns while the encoder learns to recognize deviations
+
+This design ensures that the prompt tokens and tokenizer module learn robust frequency-domain representations through reconstruction and orthogonality constraints, while the Transformer encoder and classification head learn to distinguish between normal patterns and the artificially generated pseudo-anomalies.
 
 ## 5 Training Objective
 
