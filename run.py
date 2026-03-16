@@ -188,7 +188,7 @@ def train(args):
             # loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
 
             # 添加正交损失和均匀性损失到总损失（使用动态权重）
-            loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring + dynamic_weights['ortho_loss_weight'] * ortho_loss + dynamic_weights['uniformity_loss_weight'] * uniformity_loss
+            loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring + dynamic_weights['ortho_loss_weight'] * ortho_loss - dynamic_weights['uniformity_loss_weight'] * uniformity_loss
 
             loss.backward()
             optimizer.step()
@@ -198,7 +198,7 @@ def train(args):
             batched_ortho_loss += ortho_loss
             batched_uniformity_loss += uniformity_loss
 
-        batched_total_loss = batched_bce_loss + batched_rec_loss + batched_ring_loss + batched_ortho_loss + batched_uniformity_loss
+        batched_total_loss = batched_bce_loss + batched_rec_loss + batched_ring_loss + batched_ortho_loss - batched_uniformity_loss
         end_time = time.time()
         total_time += end_time - start_time
         
