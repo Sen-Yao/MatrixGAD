@@ -518,8 +518,7 @@ class PromptGAD(nn.Module):
             normal_for_generation_emb = emb[:, normal_for_generation_idx, :]
 
             # ==================== 新的伪异常生成逻辑 ====================
-            # 被选取用于生成伪异常的那些正常节点，在tokenizer的过程中，随机mask掉hallucination_prompt_ratio倍数的prompt使用高温生成
-            # 其余prompt使用正常温度，然后这些伪异常prompt token正常过transformer编码器，其结果作为伪异常
+            # 被选取用于生成伪异常的那些正常节点，仅升高其主导Prompt的温度，其他Prompt温度不变
 
             # 获取用于生成伪异常的正常节点的原始token序列
             batch_normal_tokens_for_generation = input_tokens[normal_for_generation_idx, :, :]  # [num_normal_gen, num_hops+1, d]
@@ -528,22 +527,15 @@ class PromptGAD(nn.Module):
             hallucinated_temp = getattr(self.args, 'tokenizer_temp', 1.0) * getattr(self.args, 'tokenizer_hallucination_ratio', 2.0)
             normal_temp = getattr(self.args, 'tokenizer_temp', 1.0)
 
-            # ========== 原来的逻辑 (先注释保留) ==========
-            # # 使用正常温度和高温分别处理tokens，并添加detach()防止梯度回传到tokenizer和prompts
-            # normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
-            # normal_prompt_tokens = normal_prompt_tokens.detach()
-            # hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, hallucinated_temp)
-            # hallucinated_prompt_tokens = hallucinated_prompt_tokens.detach()
-            # 
-            # # 创建随机mask，决定哪些prompt使用高温
-            # B, M, d_model = normal_prompt_tokens.shape
-            # mask = torch.rand(B, M, device=batch_normal_tokens_for_generation.device) < getattr(self.args, 'hallucination_prompt_ratio', 0.2)
-            # 
-            # # 根据mask混合正常和高温处理的prompt
-            # mixed_prompt_tokens = torch.where(mask.unsqueeze(-1), hallucinated_prompt_tokens, normal_prompt_tokens)
-            # ===========================================
+            # 首先，用正常温度获取注意力权重，用于计算每个节点的主导Prompt
+            _, normal_prompt_attn_weights = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
             
-            # ========== 新逻辑：仅对前 pp_k // 2 个 token 进行升温 ==========
+            # 计算每个节点的主导Prompt
+            # 对每个节点，计算每个Prompt在所有跳数上的注意力总和
+            prompt_attn_sum = normal_prompt_attn_weights.sum(dim=-1)  # [num_normal_gen, M]
+            # 取最大值索引作为主导Prompt
+            dominant_prompts = torch.argmax(prompt_attn_sum, dim=-1)  # [num_normal_gen]
+            
             # 使用正常温度处理所有tokens
             normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
             normal_prompt_tokens = normal_prompt_tokens.detach()
@@ -552,9 +544,11 @@ class PromptGAD(nn.Module):
             hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp, partial_temp=hallucinated_temp)
             hallucinated_prompt_tokens = hallucinated_prompt_tokens.detach()
             
-            # 创建随机mask，决定哪些prompt使用部分升温
+            # 创建基于主导Prompt的mask：只有主导Prompt位置使用升温，其他保持正常
             B, M, d_model = normal_prompt_tokens.shape
-            mask = torch.rand(B, M, device=batch_normal_tokens_for_generation.device) < getattr(self.args, 'hallucination_prompt_ratio', 0.2)
+            mask = torch.zeros(B, M, dtype=torch.bool, device=batch_normal_tokens_for_generation.device)
+            # 对每个节点，只将其主导Prompt的位置设为True
+            mask[torch.arange(B), dominant_prompts] = True
             
             # 根据mask混合正常和部分升温处理的prompt
             mixed_prompt_tokens = torch.where(mask.unsqueeze(-1), hallucinated_prompt_tokens, normal_prompt_tokens)
