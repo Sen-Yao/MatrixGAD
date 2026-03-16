@@ -492,9 +492,11 @@ class PromptGAD(nn.Module):
             hallucinated_temp = getattr(self.args, 'tokenizer_temp', 1.0) * getattr(self.args, 'tokenizer_hallucination_ratio', 2.0)
             normal_temp = getattr(self.args, 'tokenizer_temp', 1.0)
 
-            # 使用正常温度和高温分别处理tokens
+            # 使用正常温度和高温分别处理tokens，并添加detach()防止梯度回传到tokenizer和prompts
             normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
+            normal_prompt_tokens = normal_prompt_tokens.detach()
             hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, hallucinated_temp)
+            hallucinated_prompt_tokens = hallucinated_prompt_tokens.detach()
 
             # 创建随机mask，决定哪些prompt使用高温
             B, M, d_model = normal_prompt_tokens.shape
