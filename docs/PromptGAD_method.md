@@ -186,11 +186,47 @@ $$
 
 where $\mathcal{N}$ is the set of training normal nodes, $\mathbf{e}_i$ is the L2-normalized embedding of node $i$, and $\tau_{\text{GNA}}$ is the temperature parameter.
 
-### 5.3 Dynamic Loss Weighting
+### 5.3 Prompt-aware Uniformity Loss (New)
+
+To achieve implicit multi-normal-pattern modeling based on node dominant frequency-domain prompts, we introduce a prompt-aware uniformity loss that requires no extra parameters or clustering modules. This loss fully reuses existing attention weights and node embeddings, aligning with graph frequency-domain decomposition theory.
+
+$$
+\mathcal{L}_{\text{uniform}} = \mathcal{L}_{\text{intra-pattern}} + \lambda_{\text{inter}} \cdot \mathcal{L}_{\text{inter-pattern}}
+$$
+
+#### Intra-Pattern Aggregation Loss
+
+Encourages nodes sharing the same dominant prompt (i.e., belonging to the same normal frequency pattern) to cluster tightly:
+
+$$
+\mathcal{L}_{\text{intra-pattern}} = \frac{1}{|\mathcal{N}|} \sum_{i \in \mathcal{N}} \log \left( \sum_{j \in \mathcal{P}(i), j \neq i} \exp\left( \frac{\mathbf{e}_i^T \mathbf{e}_j}{\tau_{\text{uniform}}} \right) \right)
+$$
+
+where $\mathcal{P}(i)$ is the set of other normal nodes sharing the same dominant prompt as node $i$. The dominant prompt for node $i$ is computed as:
+
+$$
+\text{dominant\_prompt}(i) = \arg\max_{p \in [1,M]} \left( \sum_{t=1}^k \text{attn\_weights}[i,p,t] \right)
+$$
+
+where $M$ is the total number of prompts (fixed to 8) and $\text{attn\_weights}[i,p,t]$ is the attention weight of prompt $p$ at hop $t$ for node $i$.
+
+#### Inter-Pattern Dispersion Loss
+
+Encourages different prompt-corresponding normal patterns to be separated, avoiding distribution overlap:
+
+$$
+\mathcal{L}_{\text{inter-pattern}} = \frac{1}{M(M-1)} \sum_{p=1}^M \sum_{q=p+1}^M \exp\left( \frac{\mathbf{c}_p^T \mathbf{c}_q}{\tau_{\text{uniform}}} \right)
+$$
+
+where $\mathbf{c}_p \in \mathbb{R}^D$ is the L2-normalized embedding center of all normal nodes corresponding to the $p$-th prompt, which is computed once per training step with `.detach()` to prevent gradient flow. The temperature parameter $\tau_{\text{uniform}}$ reuses the existing $\tau_{\text{GNA}}$ from the original uniformity loss.
+
+The inter-pattern weight $\lambda_{\text{inter}}$ defaults to 0.1 and can be adjusted via the `--lambda_inter` command-line argument.
+
+### 5.4 Dynamic Loss Weighting
 
 We use polynomial decay learning rate scheduling with warmup. The learning rate starts at 0, linearly warms up to $\text{peak_lr}=5e-4$ over 50 epochs, then polynomially decays to $\text{end_lr}=3e-4$.
 
-### 5.4 Inactive Components
+### 5.5 Inactive Components
 
 Note that the ring loss component has been disabled ($w_{\text{ring}}=0$) and is not used in the current implementation. Additionally, the GCN and Discriminator modules defined in the codebase are not utilized in the actual forward pass.
 

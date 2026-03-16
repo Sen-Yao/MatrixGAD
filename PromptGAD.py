@@ -575,8 +575,8 @@ class PromptGAD(nn.Module):
             # 使用原始正常节点嵌入和生成的伪异常嵌入进行对比学习
             emb_combine = torch.cat((emb[:, normal_for_train_idx, :], torch.unsqueeze(outlier_emb, 0)), 1)
             emb_combine = F.normalize(emb_combine, p=2, dim=-1)
-            # 计算 InfoNCE 均匀性损失，只计算正常节点间的排斥力
-            uniformity_loss = self.compute_infoNCE_uniformity_loss(emb, normal_for_train_idx, args)
+            # 计算 Prompt-aware 均匀性损失，基于主导频域Prompt实现隐式多正常模式建模
+            uniformity_loss = self.compute_prompt_aware_uniformity_loss(emb, normal_for_train_idx, prompt_attn_weights, args)
 
             f_1 = self.fc1(emb_combine)
         else:
@@ -675,3 +675,154 @@ class PromptGAD(nn.Module):
         uniformity_loss = log_sum_exp_values.mean()
         
         return uniformity_loss
+
+    # Prompt-aware Uniformity Loss - 基于主导频域Prompt实现隐式多正常模式建模
+    def compute_prompt_aware_uniformity_loss(self, emb, normal_for_train_idx, prompt_attn_weights, args):
+        """
+        计算基于主导频域Prompt的均匀性损失，实现隐式多正常模式建模
+        Args:
+            emb: [1, N, n_in] - 所有节点的嵌入表征
+            normal_for_train_idx: 训练时使用的正常节点索引
+            prompt_attn_weights: [N, M, num_hops] - Prompt注意力权重
+            args: 包含GNA_temp等超参数的配置
+        Returns:
+            uniformity_loss: Prompt-aware均匀性损失
+        """
+        # 提取正常节点的嵌入: [num_normal, n_in]
+        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, n_in]
+        num_normal = normal_emb.size(0)
+        
+        # 如果正常节点数量少于2，无法计算损失
+        if num_normal < 2:
+            return torch.tensor(0.0, device=emb.device)
+        
+        # L2 归一化，便于计算余弦相似度
+        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)  # [num_normal, n_in]
+        
+        # 提取正常节点对应的注意力权重
+        normal_prompt_attn = prompt_attn_weights[normal_for_train_idx, :, :]  # [num_normal, M, num_hops]
+        
+        # 步骤1: 计算每个节点的主导Prompt
+        # 对每个节点，计算每个Prompt在所有跳数上的注意力总和
+        prompt_attn_sum = normal_prompt_attn.sum(dim=-1)  # [num_normal, M]
+        # 取最大值索引作为主导Prompt
+        dominant_prompts = torch.argmax(prompt_attn_sum, dim=-1)  # [num_normal]
+        
+        M = self.num_prompts
+        tau = args.GNA_temp
+        lambda_inter = getattr(args, 'lambda_inter', 0.1)
+        
+        # 步骤2: 计算Intra-Pattern聚合损失
+        intra_loss = self.compute_intra_pattern_loss(normal_emb_norm, dominant_prompts, M, tau)
+        
+        # 步骤3: 计算Inter-Pattern分散损失
+        inter_loss = self.compute_inter_pattern_loss(normal_emb_norm, dominant_prompts, M, tau)
+        
+        # 组合损失
+        uniformity_loss = intra_loss + lambda_inter * inter_loss
+        
+        return uniformity_loss
+
+    def compute_intra_pattern_loss(self, normal_emb_norm, dominant_prompts, M, tau):
+        """
+        计算同主导Prompt节点的聚合损失（拉近距离）
+        Args:
+            normal_emb_norm: [num_normal, n_in] - L2归一化的正常节点嵌入
+            dominant_prompts: [num_normal] - 每个节点的主导Prompt索引
+            M: Prompt总数
+            tau: 温度参数
+        Returns:
+            intra_loss: 模式内聚合损失
+        """
+        num_normal = normal_emb_norm.size(0)
+        device = normal_emb_norm.device
+        
+        intra_loss = torch.tensor(0.0, device=device)
+        valid_pattern_count = 0
+        
+        for p in range(M):
+            # 找出所有主导Prompt为p的节点
+            mask = (dominant_prompts == p)
+            pattern_nodes = torch.where(mask)[0]
+            num_pattern_nodes = pattern_nodes.size(0)
+            
+            # 当某个Prompt对应的节点数<2时，跳过计算
+            if num_pattern_nodes < 2:
+                continue
+            
+            # 提取这些节点的嵌入
+            pattern_emb = normal_emb_norm[pattern_nodes, :]  # [num_pattern_nodes, n_in]
+            
+            # 计算余弦相似度矩阵
+            similarity_matrix = torch.mm(pattern_emb, pattern_emb.t())  # [num_pattern_nodes, num_pattern_nodes]
+            similarity_matrix = similarity_matrix / tau
+            
+            # 排除对角线元素
+            mask_diag = torch.eye(num_pattern_nodes, device=device, dtype=torch.bool)
+            similarity_matrix_masked = similarity_matrix.masked_fill(mask_diag, float('-inf'))
+            
+            # 计算logsumexp
+            log_sum_exp_values = torch.logsumexp(similarity_matrix_masked, dim=1)  # [num_pattern_nodes]
+            
+            # 累加损失
+            intra_loss = intra_loss + log_sum_exp_values.mean()
+            valid_pattern_count = valid_pattern_count + 1
+        
+        # 平均化
+        if valid_pattern_count > 0:
+            intra_loss = intra_loss / valid_pattern_count
+        
+        return intra_loss
+
+    def compute_inter_pattern_loss(self, normal_emb_norm, dominant_prompts, M, tau):
+        """
+        计算不同Prompt模式间的分散损失（推远距离）
+        Args:
+            normal_emb_norm: [num_normal, n_in] - L2归一化的正常节点嵌入
+            dominant_prompts: [num_normal] - 每个节点的主导Prompt索引
+            M: Prompt总数
+            tau: 温度参数
+        Returns:
+            inter_loss: 模式间分散损失
+        """
+        num_normal = normal_emb_norm.size(0)
+        device = normal_emb_norm.device
+        D = normal_emb_norm.size(1)
+        
+        # 统计每个Prompt对应的正常节点嵌入中心（使用.detach()）
+        centers = torch.zeros(M, D, device=device)
+        valid_centers_mask = torch.zeros(M, dtype=torch.bool, device=device)
+        
+        for p in range(M):
+            mask = (dominant_prompts == p)
+            if mask.sum() >= 1:
+                centers[p] = normal_emb_norm[mask].mean(dim=0).detach()
+                valid_centers_mask[p] = True
+        
+        # 获取有效中心的索引
+        valid_center_indices = torch.where(valid_centers_mask)[0]
+        num_valid_centers = valid_center_indices.size(0)
+        
+        # 如果有效中心数<2，无法计算模式间损失
+        if num_valid_centers < 2:
+            return torch.tensor(0.0, device=device)
+        
+        # 提取有效中心
+        valid_centers = centers[valid_center_indices, :]  # [num_valid_centers, D]
+        
+        # L2归一化中心
+        valid_centers_norm = F.normalize(valid_centers, p=2, dim=1)
+        
+        # 计算所有中心对之间的余弦相似度
+        similarity_matrix = torch.mm(valid_centers_norm, valid_centers_norm.t())  # [num_valid_centers, num_valid_centers]
+        similarity_matrix = similarity_matrix / tau
+        
+        # 只取上三角部分（排除对角线）
+        mask = torch.triu(torch.ones(num_valid_centers, num_valid_centers, device=device), diagonal=1)
+        mask = mask.bool()
+        
+        # 计算指数并平均
+        exp_similarities = torch.exp(similarity_matrix[mask])
+        inter_loss = exp_similarities.mean()
+        
+        return inter_loss
