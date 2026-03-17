@@ -176,12 +176,13 @@ def train(args):
             emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, _, uniformity_loss, _, _ = model(concated_input_features, None,
                                                                 None, local_normal_for_train_idx,
                                                                 train_flag, args)
-            # BCE loss
+            # BCE loss with margin constraint: L_bce = BCEWithLogits(logits - m * y, y)
             lbl = torch.unsqueeze(torch.cat(
                 (torch.zeros(len(local_normal_for_train_idx)), torch.ones(len(outlier_emb)))),
                 1).unsqueeze(0)
             lbl = lbl.to(device)  # 将标签移动到指定设备
-            loss_bce = b_xent(logits, lbl)
+            adjusted_logits = logits - args.margin_m * lbl
+            loss_bce = b_xent(adjusted_logits, lbl)
             loss_bce = torch.mean(loss_bce)
 
             # diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
@@ -388,6 +389,7 @@ if __name__ == "__main__":
 
     # Ablation Study
     parser.add_argument('--ablation_random_dir', type=str2bool, default=False, help='Ablation study: randomize perturbation direction')
+    parser.add_argument('--margin_m', type=float, default=0.15, help='Margin parameter for BCE loss constraint (0.1~0.2)')
 
 
 
