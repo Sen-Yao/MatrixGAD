@@ -1,13 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
-import time
 import math
-
-from check_gpu_memory import print_gpu_memory_usage, print_tensor_memory, clear_gpu_memory
-
-from playground import check_token_collapse
 
 class FeedForwardNetwork(nn.Module):
     def __init__(self, hidden_size, ffn_size, dropout_rate):
@@ -111,71 +105,6 @@ class EncoderLayer(nn.Module):
 
         return x, attention_weights
 
-class GCN(nn.Module):
-    def __init__(self, in_ft, out_ft, act, bias=True):
-        super(GCN, self).__init__()
-        self.fc = nn.Linear(in_ft, out_ft, bias=False)
-        self.act = nn.PReLU() if act == 'prelu' else act
-        if bias:
-            self.bias = nn.Parameter(torch.FloatTensor(out_ft))
-            self.bias.data.fill_(0.0)
-        else:
-            self.register_parameter('bias', None)
-
-        for m in self.modules():
-            self.weights_init(m)
-
-    def weights_init(self, m):
-        if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight.data)
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
-
-    def forward(self, seq, adj, sparse=False):
-        seq_fts = self.fc(seq)
-        if sparse:
-            out = torch.unsqueeze(torch.spmm(adj, torch.squeeze(seq_fts, 0)), 0)
-        else:
-            out = torch.bmm(adj, seq_fts)
-        if self.bias is not None:
-            out += self.bias
-
-        return self.act(out)
-
-
-class Discriminator(nn.Module):
-    def __init__(self, n_h, negsamp_round):
-        super(Discriminator, self).__init__()
-        self.f_k = nn.Bilinear(n_h, n_h, 1)
-
-        for m in self.modules():
-            self.weights_init(m)
-
-        self.negsamp_round = negsamp_round
-
-    def weights_init(self, m):
-        if isinstance(m, nn.Bilinear):
-            torch.nn.init.xavier_uniform_(m.weight.data)
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
-
-    def forward(self, c, h_pl):
-        scs = []
-        # positive
-        scs.append(self.f_k(h_pl, c))
-
-        # negative
-        c_mi = c
-        for _ in range(self.negsamp_round):
-            c_mi = torch.cat((c_mi[-2:-1, :], c_mi[:-1, :]), 0)
-            scs.append(self.f_k(h_pl, c_mi))
-
-        logits = torch.cat(tuple(scs))
-
-        return logits
-
-
-
 class PromptGAD(nn.Module):
     def __init__(self, n_in, n_h, activation, args):
         super(PromptGAD, self).__init__()
@@ -184,17 +113,10 @@ class PromptGAD(nn.Module):
         self.device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() and args.device >= 0 else 'cpu')
         self.args = args
 
-        # 设置批次大小
-        self.batchsize = getattr(args, 'batchsize', None)
-        
-        self.gcn1 = GCN(n_in, n_in, activation)
-        self.gcn2 = GCN(n_in, n_in, activation)
-
         # 使用 n_in 替代 n_h 作为线性层的输入维度
         self.fc1 = nn.Linear(n_in, int(n_in / 2), bias=False)
         self.fc2 = nn.Linear(int(n_in / 2), int(n_in / 4), bias=False)
         self.fc3 = nn.Linear(int(n_in / 4), 1, bias=False)
-        self.fc4 = nn.Linear(n_in, n_in, bias=False)
         self.act = nn.ReLU()
 
         self.n_in = n_in
@@ -354,90 +276,6 @@ class PromptGAD(nn.Module):
 
         return ortho_loss
     
-    def TransformerEncoder(self, tokens):
-        """
-        Inputs:
-            - tokens: 输入节点的 tokens 序列，形状 [batch_size, pp_k+1, n_in]
-        Outputs:
-            - emb: 输入节点的编码结果，形状 [1, batch_size, n_in]
-        """
-
-        emb = tokens  # 直接使用输入tokens，不进行投影
-        for i, l in enumerate(self.layers):
-            emb, current_attention_weights = self.layers[i](emb)
-            if i == len(self.layers) - 1: # 拿到最后一层的注意力
-                attention_weights = current_attention_weights
-                # 聚合多头注意力
-                agg_attention_weights = torch.mean(attention_weights, dim=1)
-                # agg_attention_weights: [N, args.pp_k+1, args.pp_k+1]
-        emb = self.final_ln(emb)
-
-        # attention_scores: [N, args.pp_k+1], 表示每个节点的自身特征 (0-hop) 对每个后续 hop 的注意力分数
-        attention_scores = agg_attention_weights[:, 0, :]
-
-        # 基于 attention_scores 进行池化，得到最终编码结果
-        # emb: [1, N, n_in]
-        emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
-
-        return emb
-
-    def TransformerEncoderWithTokens(self, tokens):
-        """
-        处理已经投影过的 tokens（包含原始 tokens 和 prompt tokens 的组合）
-
-        Inputs:
-            - tokens: 已经投影过的 tokens 序列，形状 [batch_size, pp_k+1 + M, n_in]
-        Outputs:
-            - emb: 输入节点的编码结果，形状 [1, batch_size, n_in]
-        """
-        for i, l in enumerate(self.layers):
-            tokens, current_attention_weights = self.layers[i](tokens)
-            if i == len(self.layers) - 1:  # 拿到最后一层的注意力
-                attention_weights = current_attention_weights
-                # 聚合多头注意力
-                agg_attention_weights = torch.mean(attention_weights, dim=1)
-                # agg_attention_weights: [N, pp_k+1 + M, pp_k+1 + M]
-        emb = self.final_ln(tokens)
-
-        # attention_scores: [N, pp_k+1 + M]
-        # 我们关注前 pp_k+1 个位置（原始 tokens）的第一个位置（0-hop）对所有位置的注意力
-        attention_scores = agg_attention_weights[:, 0, :]
-
-        # 基于 attention_scores 进行池化，得到最终编码结果
-        # emb: [1, N, n_in]
-        emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
-
-        return emb
-
-    def TransformerEncoderWithPromptTokens(self, tokens):
-        """
-        处理只有 prompt_tokens 的情况（不包含原始 tokens）
-
-        Inputs:
-            - tokens: 已经投影过的 prompt_tokens 序列，形状 [batch_size, M, n_in]
-        Outputs:
-            - emb: 输入节点的编码结果，形状 [1, batch_size, n_in]
-        """
-        for i, l in enumerate(self.layers):
-            tokens, current_attention_weights = self.layers[i](tokens)
-            if i == len(self.layers) - 1:  # 拿到最后一层的注意力
-                attention_weights = current_attention_weights
-                # 聚合多头注意力
-                agg_attention_weights = torch.mean(attention_weights, dim=1)
-                # agg_attention_weights: [N, M, M]
-        emb = self.final_ln(tokens)
-
-        # 由于只有 M 个 prompt_tokens，没有特定的 0-hop 位置
-        # 我们对所有位置的注意力进行平均池化，得到统一的注意力分数
-        # attention_scores: [N, M]，对每一行进行平均
-        attention_scores = torch.mean(agg_attention_weights, dim=1)
-
-        # 基于 attention_scores 进行池化，得到最终编码结果
-        # emb: [1, N, n_in]
-        emb = torch.bmm(attention_scores.unsqueeze(1), emb).squeeze(1).unsqueeze(0)
-
-        return emb
-
     def TransformerEncoderWithCLS(self, tokens):
         """
         使用 CLS token 处理 tokens，CLS token 经过多层更新后直接作为输出
@@ -701,115 +539,6 @@ class PromptGAD(nn.Module):
         token_rec_loss = F.mse_loss(reconstructed_tokens, target_tokens)
         
         return token_rec_loss
-
-
-    # InfoNCE uniformity loss - 推开不同正常节点间的距离
-    def compute_infoNCE_uniformity_loss(self, emb, normal_for_train_idx, args):
-        """
-        计算InfoNCE均匀性损失，推开不同正常节点在嵌入空间中的距离
-        Args:
-            emb: [1, N, n_in] - 所有节点的嵌入表征
-            normal_for_train_idx: 训练时使用的正常节点索引
-            args: 包含GNA_temp等超参数的配置
-        Returns:
-            uniformity_loss: InfoNCE均匀性损失
-        """
-        # 提取正常节点的嵌入: [num_normal, n_in]
-        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, n_in]
-        num_normal = normal_emb.size(0)
-        
-        # 调试信息：打印正常节点数量
-        # print(f"[DEBUG] num_normal in batch: {num_normal}")
-        
-        # 如果正常节点数量少于2，无法计算InfoNCE损失
-        if num_normal < 2:
-            # print(f"[WARNING] num_normal={num_normal} < 2, returning 0.0 for uniformity_loss")
-            return torch.tensor(0.0, device=emb.device)
-        
-        # L2 归一化，便于计算余弦相似度
-        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)  # [num_normal, n_in]
-        
-        # 计算所有节点对之间的余弦相似度矩阵
-        # similarity_matrix[i,j] = cos_sim(node_i, node_j)
-        similarity_matrix = torch.mm(normal_emb_norm, normal_emb_norm.t())  # [num_normal, num_normal]
-        
-        # 应用温度参数
-        similarity_matrix = similarity_matrix / args.GNA_temp
-        
-        # 创建掩码，排除对角线元素（自己与自己的相似度）
-        mask = torch.eye(num_normal, device=emb.device, dtype=torch.bool)
-        
-        # 并行计算InfoNCE损失
-        # 对于每个锚点i，我们希望它与其他所有节点的相似度都尽可能小
-        # 使用掩码将对角线元素设为极小值，这样就不会影响logsumexp计算
-        similarity_matrix_masked = similarity_matrix.masked_fill(mask, float('-inf'))
-
-        # 并行计算所有节点的logsumexp值
-        # 对每一行计算logsumexp，得到每个节点与其他节点的相似度之和
-        log_sum_exp_values = torch.logsumexp(similarity_matrix_masked, dim=1)  # [num_normal]
-
-        # 平均化损失
-        uniformity_loss = log_sum_exp_values.mean()
-        
-        return uniformity_loss
-
-    # Prompt-aware Uniformity Loss - 基于主导频域Prompt实现隐式多正常模式建模
-    def compute_prompt_aware_uniformity_loss(self, emb, normal_for_train_idx, prompt_attn_weights, args):
-        """
-        计算基于主导频域Prompt的均匀性损失，实现隐式多正常模式建模
-        Args:
-            emb: [1, N, n_in] - 所有节点的嵌入表征
-            normal_for_train_idx: 训练时使用的正常节点索引
-            prompt_attn_weights: [N, M, num_hops] - Prompt注意力权重
-            args: 包含GNA_temp等超参数的配置
-        Returns:
-            uniformity_loss: Prompt-aware均匀性损失
-        """
-        # 提取正常节点的嵌入: [num_normal, n_in]
-        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, n_in]
-        num_normal = normal_emb.size(0)
-        
-        # 如果正常节点数量少于2，无法计算损失
-        if num_normal < 2:
-            return torch.tensor(0.0, device=emb.device)
-        
-        # L2 归一化，便于计算余弦相似度
-        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)  # [num_normal, n_in]
-        
-        # 提取正常节点对应的注意力权重
-        normal_prompt_attn = prompt_attn_weights[normal_for_train_idx, :, :]  # [num_normal, M, num_hops]
-        
-        # 步骤1: 计算每个节点的主导Prompt
-        # 对每个节点，计算每个Prompt在所有跳数上的注意力总和
-        prompt_attn_sum = normal_prompt_attn.sum(dim=-1)  # [num_normal, M]
-        # 取最大值索引作为主导Prompt
-        dominant_prompts = torch.argmax(prompt_attn_sum, dim=-1)  # [num_normal]
-        
-        # 步骤2: 计算Prompt中心（因为compute_inter_pattern_loss现在需要这个参数）
-        M = self.num_prompts
-        D = normal_emb_norm.size(1)
-        device = normal_emb_norm.device
-        
-        prompt_centers = torch.zeros(M, D, device=device)
-        
-        for p in range(M):
-            mask = (dominant_prompts == p)
-            if mask.sum() >= 1:
-                prompt_centers[p] = normal_emb_norm[mask].mean(dim=0).detach()
-        
-        tau = args.GNA_temp
-        lambda_inter = getattr(args, 'lambda_inter', 0.1)
-        
-        # 步骤2: 计算Intra-Pattern聚合损失
-        intra_loss = self.compute_intra_pattern_loss(normal_emb_norm, dominant_prompts, M, tau)
-        
-        # 步骤3: 计算Inter-Pattern分散损失
-        inter_loss = self.compute_inter_pattern_loss(normal_emb_norm, dominant_prompts, prompt_centers, M, tau)
-        
-        # 组合损失
-        uniformity_loss = intra_loss + lambda_inter * inter_loss
-        
-        return uniformity_loss
 
     def compute_intra_pattern_loss(self, normal_emb_norm, dominant_prompts, M, tau):
         """
