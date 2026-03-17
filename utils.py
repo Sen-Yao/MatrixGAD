@@ -714,8 +714,8 @@ def get_dynamic_loss_weights(epoch, args):
         # warmup阶段：只开启community_loss和正常节点内部的对比损失
         return {
             'margin_loss_weight': args.margin_loss_weight,
-            'bce_loss_weight': args.bce_loss_weight,
-            'rec_loss_weight': args.rec_loss_weight,
+            'bce_loss_weight': 0.0 * args.bce_loss_weight,
+            'rec_loss_weight': 0.0 * args.rec_loss_weight,
             'con_loss_weight': args.con_loss_weight,
             'proj_loss_weight': 0.0,
             'reconstruction_loss_weight': args.reconstruction_loss_weight,
@@ -729,8 +729,8 @@ def get_dynamic_loss_weights(epoch, args):
         
         return {
             'margin_loss_weight': args.margin_loss_weight,
-            'bce_loss_weight': args.bce_loss_weight,
-            'rec_loss_weight': args.rec_loss_weight,
+            'bce_loss_weight': progress * args.bce_loss_weight,
+            'rec_loss_weight': progress * args.rec_loss_weight,
             'con_loss_weight': args.con_loss_weight,
             'proj_loss_weight': progress * args.proj_loss_weight,
             'reconstruction_loss_weight': args.reconstruction_loss_weight,
