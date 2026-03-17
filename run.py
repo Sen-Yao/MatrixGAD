@@ -376,6 +376,8 @@ if __name__ == "__main__":
     parser.add_argument('--tokenizer_hallucination_ratio', type=float, default=2.0, help='Hallucination ratio multiplier for temperature during pseudo anomaly generation')
     parser.add_argument('--hallucination_prompt_ratio', type=float, default=0.2, help='Ratio of prompts to apply hallucination temperature during pseudo anomaly generation')
     parser.add_argument('--lambda_inter', type=float, default=0.1, help='Weight for inter-pattern dispersion loss in prompt-aware uniformity loss')
+    parser.add_argument('--hallucination_temp_distance_scale', type=float, default=0.0, 
+                        help='Scaling factor for distance-based temperature adjustment during pseudo-anomaly generation (0 = disable dynamic temperature)')
 
     parser.add_argument('--warmup_updates', type=int, default=50)
     parser.add_argument('--tot_updates', type=int, default=1000)

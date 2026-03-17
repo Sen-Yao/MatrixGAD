@@ -122,19 +122,71 @@ where $\text{target_tokens}$ are the flattened original frequency-domain tokens.
 
 ### 4.2 Pseudo-Anomaly Generation via Partial Temperature Hallucination
 
-Instead of using reconstruction errors, we generate pseudo-anomalies using a partial temperature hallucination approach:
+Instead of using reconstruction errors, we generate pseudo-anomalies using a partial temperature hallucination approach with **dominant-prompt selective temperature elevation** and **dynamic distance-based temperature scaling**.
 
-For each normal node selected for pseudo-anomaly generation, we randomly apply an increased temperature parameter to only a subset of prompts during the tokenizer process. **Importantly, the temperature elevation is only applied to the first `pp_k // 2` tokens (hops), while the later tokens use the normal temperature.** The process is as follows:
+#### 4.2.1 Dominant-Prompt Selective Temperature Elevation
+
+For each normal node selected for pseudo-anomaly generation, we only apply an increased temperature parameter to its **dominant prompt** (the prompt with the largest attention weight) during the tokenizer process. **Importantly, the temperature elevation is only applied to the first `pp_k // 2` tokens (hops), while the later tokens use the normal temperature.** The process is as follows:
 
 1. Select a subset of normal nodes for pseudo-anomaly generation based on the sample rate
-2. For these selected nodes, randomly determine which prompts will use elevated temperature based on the hallucination_prompt_ratio hyperparameter
-3. Apply partial temperature elevation: for selected prompts, use elevated temperature $\tau_{\text{hallucinated}} = \tau \times \text{hallucination\_ratio}$ only for the first `pp_k // 2` tokens, while using normal temperature $\tau$ for all other tokens; for non-selected prompts, use normal temperature $\tau$ for all tokens
-4. Process the normal tokens through the tokenizer with mixed temperatures: normal tokens → Prompt extraction (with partial temperature elevation for selected prompts) → Transformer encoding → CLS output, generating pseudo-anomaly samples
+2. For these selected nodes, compute the dominant prompt for each node:
+   $$
+   \text{dominant\_prompt}(i) = \arg\max_{p \in [1,M]} \left( \sum_{t=1}^k \text{attn\_weights}[i,p,t] \right)
+   $$
+3. Apply partial temperature elevation **only to the dominant prompt**:
+   - For the dominant prompt of each node: use elevated temperature $\tau_{\text{hallucinated}} = \tau \times \text{hallucination\_ratio}$ only for the first `pp_k // 2` tokens, while using normal temperature $\tau$ for all other tokens
+   - For all non-dominant prompts: use normal temperature $\tau$ for all tokens
+4. Process the normal tokens through the tokenizer with mixed temperatures: normal tokens → Prompt extraction (with partial temperature elevation only for the dominant prompt) → Transformer encoding → CLS output, generating pseudo-anomaly samples
 5. Compute the binary cross-entropy loss between normal node representations and the generated pseudo-anomaly representations
 
-This approach creates meaningful yet artificial anomalies by selectively increasing the randomness and uncertainty in the token extraction process for certain frequency-domain perspectives, particularly focusing on the earlier hops (first `pp_k // 2` tokens). By only elevating temperature for the earlier hops, we maintain more stable representations for the later hops while still introducing sufficient diversity in the pseudo-anomaly generation. The partial temperature elevation encourages the model to explore more diverse frequency-domain perspectives for specific prompts while maintaining stability in others, leading to pseudo-anomalies that are distinct from normal patterns.
+This approach creates meaningful yet artificial anomalies by selectively increasing the randomness and uncertainty in the token extraction process for each node's most important frequency-domain perspective (dominant prompt), particularly focusing on the earlier hops (first `pp_k // 2` tokens). By only elevating temperature for the dominant prompt, we ensure that the pseudo-anomaly generation targets the most representative frequency pattern for each node while maintaining stability in other perspectives.
 
-### 4.2.1 Gradient Flow Control with Detach()
+#### 4.2.2 Dynamic Distance-Based Temperature Scaling
+
+To further improve the quality of pseudo-anomalies, we introduce **dynamic temperature scaling based on the distance from each node to its dominant prompt center**. This allows nodes that are further from their cluster centers to have higher hallucination temperatures, potentially generating more diverse anomalies.
+
+For each normal node $i$ selected for pseudo-anomaly generation:
+
+1. Compute the L2-normalized embedding of the node: $\mathbf{e}_i = \text{normalize}(\text{emb}[i])$
+2. Compute the embedding center $\mathbf{c}_p$ for the node's dominant prompt $p$ (based on training normal nodes, detached from gradient flow)
+3. Compute the Euclidean distance from the node to its dominant prompt center:
+   $$
+   d_i = \|\mathbf{e}_i - \mathbf{c}_p\|_2
+   $$
+4. Normalize the distance using the maximum distance within the batch:
+   $$
+   \hat{d}_i = \frac{d_i}{\max_{j} d_j + \epsilon}
+   $$
+5. Compute the dynamic temperature ratio for each node:
+   $$
+   \text{dynamic\_ratio}_i = 1 + (\text{base\_hallucinated\_ratio} - 1) \times (1 + \alpha \times \hat{d}_i)
+   $$
+   where $\alpha$ is the `hallucination_temp_distance_scale` hyperparameter (default: 0.0, meaning disabled) and base_hallucinated_ratio is the `tokenizer_hallucination_ratio` (default: 2.0)
+6. The final temperature for the dominant prompt of node $i$ becomes:
+   $$
+   \tau_{\text{hallucinated},i} = \tau \times \text{dynamic\_ratio}_i
+   $$
+
+When $\alpha = 0$, this reduces to the fixed temperature scaling approach. When $\alpha > 0$, nodes further from their cluster centers have higher hallucination temperatures, potentially generating more diverse pseudo-anomalies.
+
+#### 4.2.3 Vectorized Batch Implementation
+
+To ensure efficient computation even with dynamic temperature scaling, we implement a fully vectorized batch approach that requires only **2 tokenizer calls per batch**, instead of 2×N calls with a naive per-sample loop:
+
+1. First tokenizer call: process all nodes with normal temperature (no elevation) to obtain `normal_prompt_tokens`
+2. Second tokenizer call: process all nodes with `temperature_per_sample=dynamic_ratios` and `partial_temp=base_hallucinated_ratio × τ` to obtain `hallucinated_prompt_tokens`
+3. Create a mask based on each node's dominant prompt
+4. Mix the two tokenizer outputs using the mask:
+   $$
+   \text{mixed\_prompt\_tokens}[i,p] = \begin{cases}
+   \text{hallucinated\_prompt\_tokens}[i,p] & \text{if } p = \text{dominant\_prompt}(i) \\
+   \text{normal\_prompt\_tokens}[i,p] & \text{otherwise}
+   \end{cases}
+   $$
+
+This vectorized implementation maintains high computational efficiency while supporting dynamic distance-based temperature scaling.
+
+### 4.2.4 Gradient Flow Control with Detach()
 
 To ensure proper gradient flow separation during pseudo-anomaly generation, we apply `.detach()` to the tokenizer outputs when generating pseudo-anomalies. This design decision has important implications for the training dynamics:
 

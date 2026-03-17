@@ -242,7 +242,7 @@ class PromptGAD(nn.Module):
         # 将模型移动到指定设备
         self.to(self.device)
 
-    def tokenizer(self, raw_tokens, tokenizer_temp=None, partial_temp=None):
+    def tokenizer(self, raw_tokens, tokenizer_temp=None, partial_temp=None, temperature_per_sample=None):
         """
         使用可学习的 Prompt Token 对原始 tokens 进行交叉注意力查询，
         提取 M 种不同的"频域视角"特征。
@@ -253,6 +253,9 @@ class PromptGAD(nn.Module):
             tokenizer_temp: 温度参数，默认为 self.args.tokenizer_temp
             partial_temp: 如果不为 None，则只对前 pp_k // 2 个 token 使用此温度，
                          后面的 token 使用 tokenizer_temp。这样可以实现部分升温。
+            temperature_per_sample: 如果不为 None，则每个样本使用不同的温度倍数 [Batch]
+                         最终温度 = tokenizer_temp * temperature_per_sample[i] (对正常token)
+                         最终温度 = partial_temp * temperature_per_sample[i] (对部分升温token)
 
         Returns:
             prompt_tokens: 提取的新视角 Token [Batch, M, n_in]
@@ -280,27 +283,29 @@ class PromptGAD(nn.Module):
         # range: [-1, 1]
         score_sign = torch.matmul(self.sign_q(Q), self.sign_k(K).transpose(-1, -2))
         
-        # ========== 原来的逻辑 (先注释保留) ==========
-        # magnitude = F.softmax(score_mag / tokenizer_temp, dim=-1)
-        # sign = torch.tanh(score_sign / tokenizer_temp)
-        # ===========================================
-        
-        # ========== 新逻辑：支持部分升温 ==========
-        if partial_temp is not None:
-            # 只对前 pp_k // 2 个 token 使用高温，后面的使用正常温度
+        # ========== 新逻辑：支持每个样本不同温度倍数 + 部分升温 ==========
+        if partial_temp is not None or temperature_per_sample is not None:
             # 注意：num_hops = pp_k + 1，所以 pp_k = num_hops - 1
             pp_k = num_hops - 1
-            partial_idx = pp_k // 2  # 前 pp_k // 2 个 token（不包括 0-hop？或者包括？按照任务描述是前 pp_k // 2 个）
+            partial_idx = pp_k // 2  # 前 pp_k // 2 个 token
             
-            # 创建温度掩码：前 partial_idx + 1 个位置（包括 0-hop）使用 partial_temp，后面的使用 tokenizer_temp
-            # 或者按照任务描述：仅升温前 pp_k // 2 个 token（可能是指 hop 1 到 hop pp_k//2）
-            # 这里按照任务描述：前 pp_k // 2 个 token（从 1-hop 开始算）
-            temp_mask = torch.ones(B, M, num_hops, device=raw_tokens.device) * tokenizer_temp
-            
-            # 前 partial_idx 个 hop（1-hop 到 partial_idx-hop）使用高温
-            # 注意：索引 0 是 0-hop，索引 1 是 1-hop，...，索引 pp_k 是 pp_k-hop
-            if partial_idx > 0:
-                temp_mask[:, :, 1:partial_idx+1] = partial_temp
+            # 创建温度掩码
+            if temperature_per_sample is not None:
+                # 每个样本有不同的温度倍数
+                temp_multiplier = temperature_per_sample.view(B, 1, 1)  # [B, 1, 1]
+                
+                # 基础温度 = tokenizer_temp * temp_multiplier
+                temp_mask = torch.ones(B, M, num_hops, device=raw_tokens.device) * tokenizer_temp * temp_multiplier
+                
+                # 部分升温：前 pp_k//2 个位置的温度 = partial_temp * temp_multiplier
+                if partial_idx > 0 and partial_temp is not None:
+                    high_temp = partial_temp * temp_multiplier  # [B, 1, 1]
+                    temp_mask[:, :, 1:partial_idx+1] = high_temp.expand(-1, M, partial_idx)
+            else:
+                # 所有样本使用相同温度
+                temp_mask = torch.ones(B, M, num_hops, device=raw_tokens.device) * tokenizer_temp
+                if partial_idx > 0 and partial_temp is not None:
+                    temp_mask[:, :, 1:partial_idx+1] = partial_temp
             
             # 应用不同的温度
             magnitude = F.softmax(score_mag / temp_mask, dim=-1)
@@ -517,49 +522,125 @@ class PromptGAD(nn.Module):
             normal_for_generation_idx = normal_for_train_idx[: int(len(normal_for_train_idx) * args.sample_rate)]            
             normal_for_generation_emb = emb[:, normal_for_generation_idx, :]
 
-            # ==================== 新的伪异常生成逻辑 ====================
-            # 被选取用于生成伪异常的那些正常节点，仅升高其主导Prompt的温度，其他Prompt温度不变
-
-            # 获取用于生成伪异常的正常节点的原始token序列
-            batch_normal_tokens_for_generation = input_tokens[normal_for_generation_idx, :, :]  # [num_normal_gen, num_hops+1, d]
-
-            # 计算增温后的tokenizer温度
-            hallucinated_temp = getattr(self.args, 'tokenizer_temp', 1.0) * getattr(self.args, 'tokenizer_hallucination_ratio', 2.0)
-            normal_temp = getattr(self.args, 'tokenizer_temp', 1.0)
-
-            # 首先，用正常温度获取注意力权重，用于计算每个节点的主导Prompt
-            _, normal_prompt_attn_weights = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
+            # 首先统一计算主导Prompt和中心（用于uniformity loss）
+            # 这样即使不使用动态温度，也能复用计算结果
+            dominant_prompts_all, dominant_prompts_normal, prompt_centers, normal_emb_norm = \
+                self.compute_dominant_prompts_and_centers(emb, normal_for_train_idx, prompt_attn_weights)
             
-            # 计算每个节点的主导Prompt
-            # 对每个节点，计算每个Prompt在所有跳数上的注意力总和
-            prompt_attn_sum = normal_prompt_attn_weights.sum(dim=-1)  # [num_normal_gen, M]
-            # 取最大值索引作为主导Prompt
-            dominant_prompts = torch.argmax(prompt_attn_sum, dim=-1)  # [num_normal_gen]
+            # 获取超参数
+            distance_scale = getattr(self.args, 'hallucination_temp_distance_scale', 0.0)
             
-            # 使用正常温度处理所有tokens
-            normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
-            normal_prompt_tokens = normal_prompt_tokens.detach()
-            
-            # 使用部分升温：前 pp_k // 2 个 token 使用高温，后面的使用正常温度
-            hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp, partial_temp=hallucinated_temp)
-            hallucinated_prompt_tokens = hallucinated_prompt_tokens.detach()
-            
-            # 创建基于主导Prompt的mask：只有主导Prompt位置使用升温，其他保持正常
-            B, M, d_model = normal_prompt_tokens.shape
-            mask = torch.zeros(B, M, dtype=torch.bool, device=batch_normal_tokens_for_generation.device)
-            # 对每个节点，只将其主导Prompt的位置设为True
-            mask[torch.arange(B), dominant_prompts] = True
-            
-            # 根据mask混合正常和部分升温处理的prompt
-            mixed_prompt_tokens = torch.where(mask.unsqueeze(-1), hallucinated_prompt_tokens, normal_prompt_tokens)
-            # ===========================================
+            # 根据hallucination_temp_distance_scale判断是否使用动态温度
+            if distance_scale > 0:
+                # ==================== 动态温度伪异常生成逻辑（批次级高效实现） ====================
+                # 仅当 hallucination_temp_distance_scale > 0 时启用
+                # 幻觉温度倍数_i = 1 + (base_hallucinated_ratio - 1) × (1 + distance_scale × 归一化距离_i)
 
-            # 使用CLS token处理混合后的prompt_tokens作为伪异常
-            hallucinated_emb = self.TransformerEncoderWithCLS(mixed_prompt_tokens)
-            hallucinated_emb = F.normalize(hallucinated_emb, p=2, dim=-1)
+                # 获取用于生成伪异常的正常节点的原始token序列
+                batch_normal_tokens_for_generation = input_tokens[normal_for_generation_idx, :, :]  # [num_normal_gen, num_hops+1, d]
+                
+                # 获取用于生成伪异常的节点的主导Prompt
+                dominant_prompts_gen = dominant_prompts_all[normal_for_generation_idx]  # [num_normal_gen]
+                
+                # 计算这些节点到各自主导Prompt中心的欧氏距离
+                gen_emb_norm = F.normalize(emb[0, normal_for_generation_idx, :], p=2, dim=1)  # [num_normal_gen, n_in]
+                
+                # 对每个节点，获取其主导Prompt的中心
+                centers_for_gen = prompt_centers[dominant_prompts_gen]  # [num_normal_gen, n_in]
+                
+                # 计算欧氏距离
+                distances = torch.norm(gen_emb_norm - centers_for_gen, dim=1)  # [num_normal_gen]
+                
+                # 归一化距离（批次内最大距离归一化）
+                max_distance = distances.max() if distances.numel() > 0 else 1.0
+                normalized_distances = distances / (max_distance + 1e-8)  # [num_normal_gen]
+                
+                # 获取超参数
+                normal_temp = getattr(self.args, 'tokenizer_temp', 1.0)
+                base_hallucinated_ratio = getattr(self.args, 'tokenizer_hallucination_ratio', 2.0)
+                
+                # 对每个样本动态计算温度倍数
+                # 幻觉温度倍数_i = 1 + (base_hallucinated_ratio - 1) × (1 + distance_scale × normalized_distance_i)
+                # 这样当 normalized_distance_i = 0 时，倍数为 base_hallucinated_ratio
+                # 当 normalized_distance_i = 1 时，倍数为 1 + (base_hallucinated_ratio - 1) × (1 + distance_scale)
+                dynamic_ratios = 1.0 + (base_hallucinated_ratio - 1.0) * (1.0 + distance_scale * normalized_distances)
+                
+                # ==================== 批次级处理（2次tokenizer调用）====================
+                # 第一次调用：全部用正常温度（temperature_per_sample=None）
+                normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
+                normal_prompt_tokens = normal_prompt_tokens.detach()
+                
+                # 第二次调用：每个样本用自己的dynamic_ratios作为温度倍数 + 部分升温
+                # temperature_per_sample=dynamic_ratios，partial_temp=base_hallucinated_ratio * normal_temp
+                hallucinated_temp_base = base_hallucinated_ratio * normal_temp
+                hallucinated_prompt_tokens, _ = self.tokenizer(
+                    batch_normal_tokens_for_generation, 
+                    normal_temp, 
+                    partial_temp=hallucinated_temp_base,
+                    temperature_per_sample=dynamic_ratios
+                )
+                hallucinated_prompt_tokens = hallucinated_prompt_tokens.detach()
+                
+                # 创建基于主导Prompt的mask：只有主导Prompt位置使用升温，其他保持正常
+                B_gen, M, d_model = normal_prompt_tokens.shape
+                mask = torch.zeros(B_gen, M, dtype=torch.bool, device=batch_normal_tokens_for_generation.device)
+                # 对每个节点，只将其主导Prompt的位置设为True
+                mask[torch.arange(B_gen), dominant_prompts_gen] = True
+                
+                # 根据mask混合正常和部分升温处理的prompt
+                mixed_prompt_tokens = torch.where(mask.unsqueeze(-1), hallucinated_prompt_tokens, normal_prompt_tokens)
+                # ===========================================
 
-            # 将混合处理后的嵌入作为伪异常样本
-            outlier_emb = hallucinated_emb.squeeze(0)  # [num_normal_gen, n_in]
+                # 使用CLS token处理混合后的prompt_tokens作为伪异常
+                hallucinated_emb = self.TransformerEncoderWithCLS(mixed_prompt_tokens)
+                hallucinated_emb = F.normalize(hallucinated_emb, p=2, dim=-1)
+
+                # 将混合处理后的嵌入作为伪异常样本
+                outlier_emb = hallucinated_emb.squeeze(0)  # [num_normal_gen, n_in]
+            else:
+                # ==================== 原始高效伪异常生成逻辑（默认） ====================
+                # 被选取用于生成伪异常的那些正常节点，仅升高其主导Prompt的温度，其他Prompt温度不变
+
+                # 获取用于生成伪异常的正常节点的原始token序列
+                batch_normal_tokens_for_generation = input_tokens[normal_for_generation_idx, :, :]  # [num_normal_gen, num_hops+1, d]
+
+                # 计算增温后的tokenizer温度
+                hallucinated_temp = getattr(self.args, 'tokenizer_temp', 1.0) * getattr(self.args, 'tokenizer_hallucination_ratio', 2.0)
+                normal_temp = getattr(self.args, 'tokenizer_temp', 1.0)
+
+                # 首先，用正常温度获取注意力权重，用于计算每个节点的主导Prompt
+                _, normal_prompt_attn_weights = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
+                
+                # 计算每个节点的主导Prompt
+                # 对每个节点，计算每个Prompt在所有跳数上的注意力总和
+                prompt_attn_sum = normal_prompt_attn_weights.sum(dim=-1)  # [num_normal_gen, M]
+                # 取最大值索引作为主导Prompt
+                dominant_prompts = torch.argmax(prompt_attn_sum, dim=-1)  # [num_normal_gen]
+                
+                # 使用正常温度处理所有tokens
+                normal_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp)
+                normal_prompt_tokens = normal_prompt_tokens.detach()
+                
+                # 使用部分升温：前 pp_k // 2 个 token 使用高温，后面的使用正常温度
+                hallucinated_prompt_tokens, _ = self.tokenizer(batch_normal_tokens_for_generation, normal_temp, partial_temp=hallucinated_temp)
+                hallucinated_prompt_tokens = hallucinated_prompt_tokens.detach()
+                
+                # 创建基于主导Prompt的mask：只有主导Prompt位置使用升温，其他保持正常
+                B, M, d_model = normal_prompt_tokens.shape
+                mask = torch.zeros(B, M, dtype=torch.bool, device=batch_normal_tokens_for_generation.device)
+                # 对每个节点，只将其主导Prompt的位置设为True
+                mask[torch.arange(B), dominant_prompts] = True
+                
+                # 根据mask混合正常和部分升温处理的prompt
+                mixed_prompt_tokens = torch.where(mask.unsqueeze(-1), hallucinated_prompt_tokens, normal_prompt_tokens)
+                # ===========================================
+
+                # 使用CLS token处理混合后的prompt_tokens作为伪异常
+                hallucinated_emb = self.TransformerEncoderWithCLS(mixed_prompt_tokens)
+                hallucinated_emb = F.normalize(hallucinated_emb, p=2, dim=-1)
+
+                # 将混合处理后的嵌入作为伪异常样本
+                outlier_emb = hallucinated_emb.squeeze(0)  # [num_normal_gen, n_in]
 
             # ===========================================================
 
@@ -570,7 +651,9 @@ class PromptGAD(nn.Module):
             emb_combine = torch.cat((emb[:, normal_for_train_idx, :], torch.unsqueeze(outlier_emb, 0)), 1)
             emb_combine = F.normalize(emb_combine, p=2, dim=-1)
             # 计算 Prompt-aware 均匀性损失，基于主导频域Prompt实现隐式多正常模式建模
-            uniformity_loss = self.compute_prompt_aware_uniformity_loss(emb, normal_for_train_idx, prompt_attn_weights, args)
+            # 复用已计算的结果，避免重复计算
+            uniformity_loss = self.compute_prompt_aware_uniformity_loss_with_precomputed(
+                normal_emb_norm, dominant_prompts_normal, prompt_centers, args)
 
             f_1 = self.fc1(emb_combine)
         else:
@@ -702,7 +785,18 @@ class PromptGAD(nn.Module):
         # 取最大值索引作为主导Prompt
         dominant_prompts = torch.argmax(prompt_attn_sum, dim=-1)  # [num_normal]
         
+        # 步骤2: 计算Prompt中心（因为compute_inter_pattern_loss现在需要这个参数）
         M = self.num_prompts
+        D = normal_emb_norm.size(1)
+        device = normal_emb_norm.device
+        
+        prompt_centers = torch.zeros(M, D, device=device)
+        
+        for p in range(M):
+            mask = (dominant_prompts == p)
+            if mask.sum() >= 1:
+                prompt_centers[p] = normal_emb_norm[mask].mean(dim=0).detach()
+        
         tau = args.GNA_temp
         lambda_inter = getattr(args, 'lambda_inter', 0.1)
         
@@ -710,7 +804,7 @@ class PromptGAD(nn.Module):
         intra_loss = self.compute_intra_pattern_loss(normal_emb_norm, dominant_prompts, M, tau)
         
         # 步骤3: 计算Inter-Pattern分散损失
-        inter_loss = self.compute_inter_pattern_loss(normal_emb_norm, dominant_prompts, M, tau)
+        inter_loss = self.compute_inter_pattern_loss(normal_emb_norm, dominant_prompts, prompt_centers, M, tau)
         
         # 组合损失
         uniformity_loss = intra_loss + lambda_inter * inter_loss
@@ -768,32 +862,66 @@ class PromptGAD(nn.Module):
         
         return intra_loss
 
-    def compute_inter_pattern_loss(self, normal_emb_norm, dominant_prompts, M, tau):
+    def compute_dominant_prompts_and_centers(self, emb, normal_for_train_idx, prompt_attn_weights):
+        """
+        统一计算每个节点的主导Prompt和每个Prompt的中心
+        Args:
+            emb: [1, N, n_in] - 所有节点的嵌入表征
+            normal_for_train_idx: 训练时使用的正常节点索引
+            prompt_attn_weights: [N, M, num_hops] - Prompt注意力权重
+        Returns:
+            dominant_prompts_all: [N] - 所有节点的主导Prompt索引
+            dominant_prompts_normal: [num_normal] - 正常节点的主导Prompt索引
+            prompt_centers: [M, n_in] - 每个Prompt的中心（基于正常节点）
+            normal_emb_norm: [num_normal, n_in] - L2归一化的正常节点嵌入
+        """
+        # 提取正常节点的嵌入
+        normal_emb = emb[0, normal_for_train_idx, :]  # [num_normal, n_in]
+        
+        # L2归一化
+        normal_emb_norm = F.normalize(normal_emb, p=2, dim=1)  # [num_normal, n_in]
+        
+        # 提取正常节点对应的注意力权重
+        normal_prompt_attn = prompt_attn_weights[normal_for_train_idx, :, :]  # [num_normal, M, num_hops]
+        
+        # 计算所有节点的主导Prompt
+        prompt_attn_sum_all = prompt_attn_weights.sum(dim=-1)  # [N, M]
+        dominant_prompts_all = torch.argmax(prompt_attn_sum_all, dim=-1)  # [N]
+        
+        # 计算正常节点的主导Prompt
+        prompt_attn_sum_normal = normal_prompt_attn.sum(dim=-1)  # [num_normal, M]
+        dominant_prompts_normal = torch.argmax(prompt_attn_sum_normal, dim=-1)  # [num_normal]
+        
+        # 计算每个Prompt的中心（基于正常节点）
+        M = self.num_prompts
+        D = normal_emb_norm.size(1)
+        device = normal_emb_norm.device
+        
+        prompt_centers = torch.zeros(M, D, device=device)
+        
+        for p in range(M):
+            mask = (dominant_prompts_normal == p)
+            if mask.sum() >= 1:
+                prompt_centers[p] = normal_emb_norm[mask].mean(dim=0).detach()
+        
+        return dominant_prompts_all, dominant_prompts_normal, prompt_centers, normal_emb_norm
+
+    def compute_inter_pattern_loss(self, normal_emb_norm, dominant_prompts, prompt_centers, M, tau):
         """
         计算不同Prompt模式间的分散损失（推远距离）
         Args:
             normal_emb_norm: [num_normal, n_in] - L2归一化的正常节点嵌入
             dominant_prompts: [num_normal] - 每个节点的主导Prompt索引
+            prompt_centers: [M, n_in] - 预计算的Prompt中心
             M: Prompt总数
             tau: 温度参数
         Returns:
             inter_loss: 模式间分散损失
         """
-        num_normal = normal_emb_norm.size(0)
         device = normal_emb_norm.device
-        D = normal_emb_norm.size(1)
         
-        # 统计每个Prompt对应的正常节点嵌入中心（使用.detach()）
-        centers = torch.zeros(M, D, device=device)
-        valid_centers_mask = torch.zeros(M, dtype=torch.bool, device=device)
-        
-        for p in range(M):
-            mask = (dominant_prompts == p)
-            if mask.sum() >= 1:
-                centers[p] = normal_emb_norm[mask].mean(dim=0).detach()
-                valid_centers_mask[p] = True
-        
-        # 获取有效中心的索引
+        # 找出有效中心（非零向量）
+        valid_centers_mask = (prompt_centers.norm(dim=1) > 0)
         valid_center_indices = torch.where(valid_centers_mask)[0]
         num_valid_centers = valid_center_indices.size(0)
         
@@ -802,7 +930,7 @@ class PromptGAD(nn.Module):
             return torch.tensor(0.0, device=device)
         
         # 提取有效中心
-        valid_centers = centers[valid_center_indices, :]  # [num_valid_centers, D]
+        valid_centers = prompt_centers[valid_center_indices, :]  # [num_valid_centers, D]
         
         # L2归一化中心
         valid_centers_norm = F.normalize(valid_centers, p=2, dim=1)
@@ -820,3 +948,35 @@ class PromptGAD(nn.Module):
         inter_loss = exp_similarities.mean()
         
         return inter_loss
+
+    def compute_prompt_aware_uniformity_loss_with_precomputed(self, normal_emb_norm, dominant_prompts, prompt_centers, args):
+        """
+        计算基于主导频域Prompt的均匀性损失（使用预计算结果）
+        Args:
+            normal_emb_norm: [num_normal, n_in] - L2归一化的正常节点嵌入
+            dominant_prompts: [num_normal] - 每个节点的主导Prompt索引
+            prompt_centers: [M, n_in] - 预计算的Prompt中心
+            args: 包含GNA_temp等超参数的配置
+        Returns:
+            uniformity_loss: Prompt-aware均匀性损失
+        """
+        num_normal = normal_emb_norm.size(0)
+        
+        # 如果正常节点数量少于2，无法计算损失
+        if num_normal < 2:
+            return torch.tensor(0.0, device=normal_emb_norm.device)
+        
+        M = self.num_prompts
+        tau = args.GNA_temp
+        lambda_inter = getattr(args, 'lambda_inter', 0.1)
+        
+        # 步骤2: 计算Intra-Pattern聚合损失
+        intra_loss = self.compute_intra_pattern_loss(normal_emb_norm, dominant_prompts, M, tau)
+        
+        # 步骤3: 计算Inter-Pattern分散损失（使用预计算的centers）
+        inter_loss = self.compute_inter_pattern_loss(normal_emb_norm, dominant_prompts, prompt_centers, M, tau)
+        
+        # 组合损失
+        uniformity_loss = intra_loss + lambda_inter * inter_loss
+        
+        return uniformity_loss
