@@ -1,5 +1,0 @@
-使用下面的环境运行代码
-
-```
-cd /root/gpufree-data/linziyao/MatrixGAD && source /opt/miniconda3/etc/profile.d/conda.sh && conda activate GGADFormer
-```
