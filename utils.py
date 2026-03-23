@@ -714,14 +714,17 @@ def get_dynamic_loss_weights(epoch, args):
         # warmup阶段：只开启community_loss和正常节点内部的对比损失
         return {
             'margin_loss_weight': args.margin_loss_weight,
-            'bce_loss_weight': 0.0 * args.bce_loss_weight,
-            'rec_loss_weight': 0.0 * args.rec_loss_weight,
+            'bce_loss_weight': args.bce_loss_weight,
+            'rec_loss_weight': args.rec_loss_weight,
             'con_loss_weight': args.con_loss_weight,
             'proj_loss_weight': 0.0,
             'reconstruction_loss_weight': args.reconstruction_loss_weight,
             'ring_loss_weight': args.ring_loss_weight,
             'ortho_loss_weight': args.ortho_loss_weight,
-            'uniformity_loss_weight': args.uniformity_loss_weight
+            'uniformity_loss_weight': args.uniformity_loss_weight,
+            # MFMGAD 新增参数
+            'consistency_weight': getattr(args, 'consistency_weight', 1.0),
+            'contrast_weight': getattr(args, 'contrast_weight', 1.0)
         }
     else:
         # 超过warmup后，使用线性插值平滑地恢复到目标值
@@ -729,14 +732,17 @@ def get_dynamic_loss_weights(epoch, args):
         
         return {
             'margin_loss_weight': args.margin_loss_weight,
-            'bce_loss_weight': progress * args.bce_loss_weight,
-            'rec_loss_weight': progress * args.rec_loss_weight,
+            'bce_loss_weight': args.bce_loss_weight,
+            'rec_loss_weight': args.rec_loss_weight,
             'con_loss_weight': args.con_loss_weight,
             'proj_loss_weight': progress * args.proj_loss_weight,
             'reconstruction_loss_weight': args.reconstruction_loss_weight,
             'ring_loss_weight': args.ring_loss_weight,
             'ortho_loss_weight': args.ortho_loss_weight,
-            'uniformity_loss_weight': args.uniformity_loss_weight
+            'uniformity_loss_weight': args.uniformity_loss_weight,
+            # MFMGAD 新增参数
+            'consistency_weight': getattr(args, 'consistency_weight', 1.0),
+            'contrast_weight': getattr(args, 'contrast_weight', 1.0)
         }
     
 
@@ -747,3 +753,222 @@ def send_notification(content):
         requests.post(os.environ['WANDB_NOTIFY_URL'], json=payload, timeout=10)  
     except Exception as e:  
         print(f"发送通知失败: {e}")
+
+
+def analyze_multihop_correlation(tokens, ano_label, dataset_name, sample_size=5000):
+    """
+    分析多跳特征之间的相关性矩阵
+    
+    在 NAG tokenization 完成后调用，打印原始多跳特征之间的相关性
+    
+    Args:
+        tokens: 多跳特征序列 [N, K, D]，K = pp_k + 1 (Hop 0 到 Hop K-1)
+        ano_label: 异常标签 [N]，0=正常节点，1=异常节点
+        dataset_name: 数据集名称
+        sample_size: 采样节点数量（避免内存溢出），默认5000
+    
+    输出:
+        - 相邻 Hop 之间的 cosine similarity 矩阵
+        - 正常节点 vs 异常节点的相关性分布对比
+        - 各 Hop 特征的变化趋势
+    """
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+    
+    print(f"\n{'='*70}")
+    print(f"多跳特征相关性分析 - 数据集: {dataset_name}")
+    print(f"{'='*70}")
+    
+    N, K, D = tokens.shape
+    print(f"节点数量: {N}, 跳数: {K}, 特征维度: {D}")
+    
+    # 采样节点（如果节点数过多）
+    if N > sample_size:
+        indices = np.random.choice(N, sample_size, replace=False)
+        tokens_sampled = tokens[indices]
+        ano_label_sampled = ano_label[indices] if isinstance(ano_label, np.ndarray) else ano_label[indices].numpy()
+        print(f"采样 {sample_size} 个节点进行分析")
+    else:
+        tokens_sampled = tokens
+        ano_label_sampled = ano_label if isinstance(ano_label, np.ndarray) else ano_label.numpy()
+    
+    # 分离正常节点和异常节点
+    normal_mask = (ano_label_sampled == 0)
+    abnormal_mask = (ano_label_sampled == 1)
+    
+    normal_tokens = tokens_sampled[normal_mask]
+    abnormal_tokens = tokens_sampled[abnormal_mask]
+    
+    num_normal = normal_tokens.shape[0]
+    num_abnormal = abnormal_tokens.shape[0]
+    
+    print(f"正常节点: {num_normal}, 异常节点: {num_abnormal}")
+    
+    if num_normal == 0 and num_abnormal == 0:
+        print("警告: 没有有效的节点标签!")
+        return
+    
+    # ========================================
+    # 1. 计算相邻 Hop 之间的相关性矩阵
+    # ========================================
+    print(f"\n{'-'*70}")
+    print("1. 相邻 Hop 之间的 Cosine Similarity 矩阵")
+    print(f"{'-'*70}")
+    
+    # 计算所有节点的 Hop 间相似度
+    # corr(i, i+1) = cosine_similarity(X^i, X^{i+1})
+    hop_correlations = []  # 存储每对相邻 Hop 的相似度
+    
+    for i in range(K - 1):
+        hop_i = tokens_sampled[:, i, :]      # [N, D]
+        hop_i_plus_1 = tokens_sampled[:, i+1, :]  # [N, D]
+        
+        # 归一化
+        hop_i_norm = F.normalize(hop_i, p=2, dim=1)
+        hop_i_plus_1_norm = F.normalize(hop_i_plus_1, p=2, dim=1)
+        
+        # 计算每个节点的 cosine similarity
+        cos_sim = (hop_i_norm * hop_i_plus_1_norm).sum(dim=1)  # [N]
+        hop_correlations.append(cos_sim)
+    
+    # 打印相关性矩阵表头
+    print(f"\n{'Hop':<10} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'Median':>10}")
+    print("-" * 60)
+    
+    for i, cos_sim in enumerate(hop_correlations):
+        mean_val = cos_sim.mean().item()
+        std_val = cos_sim.std().item()
+        min_val = cos_sim.min().item()
+        max_val = cos_sim.max().item()
+        median_val = cos_sim.median().item()
+        print(f"Hop{i}->{i+1:<3} {mean_val:>10.4f} {std_val:>10.4f} {min_val:>10.4f} {max_val:>10.4f} {median_val:>10.4f}")
+    
+    # ========================================
+    # 2. 正常节点 vs 异常节点的相关性分布对比
+    # ========================================
+    print(f"\n{'-'*70}")
+    print("2. 正常节点 vs 异常节点的相关性分布对比")
+    print(f"{'-'*70}")
+    
+    # 分别计算正常和异常节点的 Hop 间相似度
+    normal_hop_corrs = []
+    abnormal_hop_corrs = []
+    
+    for i in range(K - 1):
+        # 正常节点
+        if num_normal > 0:
+            hop_i_norm = normal_tokens[:, i, :]
+            hop_i_plus_1_norm = normal_tokens[:, i+1, :]
+            hop_i_norm = F.normalize(hop_i_norm, p=2, dim=1)
+            hop_i_plus_1_norm = F.normalize(hop_i_plus_1_norm, p=2, dim=1)
+            normal_sim = (hop_i_norm * hop_i_plus_1_norm).sum(dim=1)
+            normal_hop_corrs.append(normal_sim)
+        else:
+            normal_hop_corrs.append(None)
+        
+        # 异常节点
+        if num_abnormal > 0:
+            hop_i_norm = abnormal_tokens[:, i, :]
+            hop_i_plus_1_norm = abnormal_tokens[:, i+1, :]
+            hop_i_norm = F.normalize(hop_i_norm, p=2, dim=1)
+            hop_i_plus_1_norm = F.normalize(hop_i_plus_1_norm, p=2, dim=1)
+            abnormal_sim = (hop_i_norm * hop_i_plus_1_norm).sum(dim=1)
+            abnormal_hop_corrs.append(abnormal_sim)
+        else:
+            abnormal_hop_corrs.append(None)
+    
+    # 打印对比表格
+    print(f"\n{'Hop':<10} {'正常节点 Mean±Std':>20} {'异常节点 Mean±Std':>20} {'差异':>10}")
+    print("-" * 70)
+    
+    for i in range(K - 1):
+        if normal_hop_corrs[i] is not None and abnormal_hop_corrs[i] is not None:
+            n_mean = normal_hop_corrs[i].mean().item()
+            n_std = normal_hop_corrs[i].std().item()
+            a_mean = abnormal_hop_corrs[i].mean().item()
+            a_std = abnormal_hop_corrs[i].std().item()
+            diff = a_mean - n_mean
+            
+            # 标注差异方向
+            if diff > 0.01:
+                diff_str = f"+{diff:.4f} ↑"
+            elif diff < -0.01:
+                diff_str = f"{diff:.4f} ↓"
+            else:
+                diff_str = f"{diff:.4f} ≈"
+            
+            print(f"Hop{i}->{i+1:<3} {n_mean:>8.4f}±{n_std:<8.4f} {a_mean:>8.4f}±{a_std:<8.4f} {diff_str:>10}")
+        else:
+            print(f"Hop{i}->{i+1:<3} {'N/A':>20} {'N/A':>20} {'N/A':>10}")
+    
+    # ========================================
+    # 3. 各 Hop 特征的变化趋势
+    # ========================================
+    print(f"\n{'-'*70}")
+    print("3. 各 Hop 特征的变化趋势 (相对于 Hop 0)")
+    print(f"{'-'*70}")
+    
+    # 以 Hop 0 为基准，计算后续 Hop 与之的差异
+    hop0 = tokens_sampled[:, 0, :]  # [N, D]
+    hop0_norm = F.normalize(hop0, p=2, dim=1)
+    
+    print(f"\n{'Hop':<10} {'Cosine Sim to Hop0':>20} {'L2 Distance':>15} {'Mean Feature Drift':>20}")
+    print("-" * 70)
+    
+    for i in range(K):
+        hop_i = tokens_sampled[:, i, :]
+        hop_i_norm = F.normalize(hop_i, p=2, dim=1)
+        
+        # Cosine similarity to Hop 0
+        cos_sim = (hop0_norm * hop_i_norm).sum(dim=1).mean().item()
+        
+        # L2 distance
+        l2_dist = torch.norm(hop_i - hop0, p=2, dim=1).mean().item()
+        
+        # Feature drift (平均特征变化)
+        feature_drift = (hop_i - hop0).abs().mean().item()
+        
+        print(f"Hop{i:<5} {cos_sim:>15.4f} {l2_dist:>15.4f} {feature_drift:>15.4f}")
+    
+    # ========================================
+    # 4. 打印完整的相关性矩阵
+    # ========================================
+    print(f"\n{'-'*70}")
+    print("4. 完整的 Hop 间 Cosine Similarity 矩阵 (所有节点)")
+    print(f"{'-'*70}")
+    
+    # 计算完整的 K x K 相关性矩阵
+    # 对每个 Hop 的特征进行平均
+    hop_means = []
+    for i in range(K):
+        hop_i = tokens_sampled[:, i, :].mean(dim=0)  # [D]
+        hop_means.append(hop_i)
+    
+    # 计算相关性矩阵
+    corr_matrix = torch.zeros(K, K)
+    for i in range(K):
+        for j in range(K):
+            hop_i_norm = F.normalize(hop_means[i].unsqueeze(0), p=2, dim=1)
+            hop_j_norm = F.normalize(hop_means[j].unsqueeze(0), p=2, dim=1)
+            corr_matrix[i, j] = (hop_i_norm * hop_j_norm).sum().item()
+    
+    # 打印矩阵
+    header = "       " + "  ".join([f"Hop{i:>4}" for i in range(K)])
+    print(f"\n{header}")
+    print("-" * (7 + 7 * K))
+    
+    for i in range(K):
+        row = "  ".join([f"{corr_matrix[i, j]:>7.4f}" for j in range(K)])
+        print(f"Hop{i:>2}  {row}")
+    
+    print(f"\n{'='*70}")
+    print("多跳特征相关性分析完成")
+    print(f"{'='*70}\n")
+    
+    return {
+        'hop_correlations': hop_correlations,
+        'normal_hop_corrs': normal_hop_corrs,
+        'abnormal_hop_corrs': abnormal_hop_corrs,
+        'correlation_matrix': corr_matrix
+    }

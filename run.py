@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from PromptGAD import PromptGAD
+from MFMGAD import MFMGAD
 from utils import *
 
 from sklearn.metrics import roc_auc_score
@@ -18,6 +18,7 @@ from utils import send_notification
 
 from playground import check_token_collapse, print_token_cosine_similarity_matrix
 from diagnostics import compute_diagnostics, print_diagnostics
+from diagnostics import compute_mfmgad_diagnostics, print_mfmgad_diagnostics, MFMGADDiagnosticCache
 
 
 # os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -51,7 +52,11 @@ def train(args):
     if args.dataset == 'dgraph':
         adj, features, labels, all_idx, idx_train, idx_val, idx_test, ano_label, _, _, normal_for_train_idx, normal_for_generation_idx = load_dgraph(train_rate=args.train_rate, val_rate=0.1, args=args)
         concated_input_features = nagphormer_tokenization(features, adj, args)
-        model = PromptGAD(features.shape[1], args.embedding_dim, 'prelu', args)
+        
+        # 分析多跳特征之间的相关性
+        analyze_multihop_correlation(concated_input_features, ano_label, args.dataset)
+        
+        model = MFMGAD(features.shape[1], args.embedding_dim, 'prelu', args)
         features = features.to(device)
         adj = adj.to(device)
         labels = torch.tensor(labels).to(device)
@@ -89,7 +94,11 @@ def train(args):
 
         # Initialize model and optimiser
         concated_input_features = nagphormer_tokenization(features.squeeze(0), adj.squeeze(0), args)
-        model = PromptGAD(ft_size, args.embedding_dim, 'prelu', args)
+        
+        # 分析多跳特征之间的相关性
+        analyze_multihop_correlation(concated_input_features, ano_label, args.dataset)
+        
+        model = MFMGAD(ft_size, args.embedding_dim, 'prelu', args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay)
     lr_scheduler = PolynomialDecayLR(
@@ -138,15 +147,20 @@ def train(args):
     sampler = Data.WeightedRandomSampler(weights, num_samples=num_nodes, replacement=True)
 
 
-    train_data_loader = Data.DataLoader(batch_data_train, batch_size=args.batch_size, sampler=sampler, num_workers=0, pin_memory=False)
-    val_data_loader = Data.DataLoader(batch_data_val, batch_size=args.batch_size, shuffle = False)
-    test_data_loader = Data.DataLoader(batch_data_test, batch_size=args.batch_size, shuffle = False)
+    # 启用 pin_memory 和多 workers 加速数据加载
+    num_workers = 4 if args.batch_size >= 1024 else 0
+    train_data_loader = Data.DataLoader(batch_data_train, batch_size=args.batch_size, sampler=sampler, 
+                                        num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False)
+    val_data_loader = Data.DataLoader(batch_data_val, batch_size=args.batch_size, shuffle=False,
+                                      num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False)
+    test_data_loader = Data.DataLoader(batch_data_test, batch_size=args.batch_size, shuffle=False,
+                                       num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False)
 
     normal_for_train_idx = torch.tensor(normal_for_train_idx, dtype=torch.long, device=device)
+    normal_for_train_set = set(normal_for_train_idx.tolist())  # 预计算 set，避免重复创建
 
     # Create diagnostic cache to use the same batch of nodes every time
-    from diagnostics import DiagnosticCache
-    diagnostic_cache = DiagnosticCache()
+    mfmgad_diagnostic_cache = MFMGADDiagnosticCache()
 
 
     # Train model
@@ -158,14 +172,14 @@ def train(args):
         start_time = time.time()
         train_flag = True
         model.train()
-        batched_bce_loss = 0
+        
+        # 损失累加器
         batched_rec_loss = 0
-        batched_ring_loss = 0
         batched_ortho_loss = 0
-        batched_uniformity_loss = 0
-        # start_time = time.time()
+        batched_consistency_loss = 0
+        batched_contrast_loss = 0
+        
         for batch_idx, item in enumerate(train_data_loader):
-            # print(f"time to start batch {time.time() - start_time}")
             concated_input_features = item[0].to(device)
             labels = item[1].to(device)
             batch_global_indices = item[2].to(device)
@@ -173,33 +187,28 @@ def train(args):
             optimizer.zero_grad()
             is_known_normal_mask = torch.isin(batch_global_indices, normal_for_train_idx)
             local_normal_for_train_idx = torch.nonzero(is_known_normal_mask, as_tuple=False).squeeze(-1)
-            emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, _, uniformity_loss, _, _ = model(concated_input_features, None,
-                                                                None, local_normal_for_train_idx,
-                                                                train_flag, args)
-            # BCE loss with margin constraint: L_bce = BCEWithLogits(logits - m * y, y)
-            lbl = torch.unsqueeze(torch.cat(
-                (torch.zeros(len(local_normal_for_train_idx)), torch.ones(len(outlier_emb)))),
-                1).unsqueeze(0)
-            lbl = lbl.to(device)  # 将标签移动到指定设备
-            adjusted_logits = logits - args.margin_m * lbl
-            loss_bce = b_xent(adjusted_logits, lbl)
-            loss_bce = torch.mean(loss_bce)
+            
+            # MFMGAD 模型前向传播
+            # 返回: (embeddings, logits, recon_loss, ortho_loss, consistency_loss, contrast_loss, suspicion_scores, attn_weights)
+            emb, logits, loss_rec, ortho_loss, consistency_loss, contrast_loss, suspicion_scores, attn_weights = model(
+                concated_input_features, None, None, local_normal_for_train_idx, train_flag, args
+            )
 
-            # diff_attribute = torch.pow(outlier_emb - noised_normal_for_generation_emb, 2)
-            # loss_rec = torch.mean(torch.sqrt(torch.sum(diff_attribute, 1)))
-
-            # 添加正交损失和均匀性损失到总损失（使用动态权重）
-            loss = dynamic_weights['bce_loss_weight'] * loss_bce + dynamic_weights['rec_loss_weight'] * loss_rec + dynamic_weights['ring_loss_weight'] * loss_ring + dynamic_weights['ortho_loss_weight'] * ortho_loss - dynamic_weights['uniformity_loss_weight'] * uniformity_loss
+            # 总损失：重构 + 正交 + 一致性 + 对比
+            loss = (dynamic_weights['rec_loss_weight'] * loss_rec + 
+                    dynamic_weights['ortho_loss_weight'] * ortho_loss +
+                    dynamic_weights['consistency_weight'] * consistency_loss +
+                    dynamic_weights['contrast_weight'] * contrast_loss)
 
             loss.backward()
             optimizer.step()
-            batched_bce_loss += loss_bce
+            
             batched_rec_loss += loss_rec
-            batched_ring_loss += loss_ring
             batched_ortho_loss += ortho_loss
-            batched_uniformity_loss += uniformity_loss
+            batched_consistency_loss += consistency_loss
+            batched_contrast_loss += contrast_loss
 
-        batched_total_loss = batched_bce_loss + batched_rec_loss + batched_ring_loss + batched_ortho_loss - batched_uniformity_loss
+        batched_total_loss = batched_rec_loss + batched_ortho_loss + batched_consistency_loss + batched_contrast_loss
         end_time = time.time()
         total_time += end_time - start_time
         
@@ -214,58 +223,77 @@ def train(args):
             'AP': f'{ap:.4f}'
         })
         pbar.update(1)
+        
         if epoch % 2 == 0:
-            wandb.log({ "batched_total_loss": batched_total_loss.item(),
-                        "bce_loss": batched_bce_loss.item(),
-                        "rec_loss": batched_rec_loss.item(),
-                        "ring_loss": batched_ring_loss.item(),
-                        "ortho_loss": batched_ortho_loss.item(),
-                        "uniformity_loss": batched_uniformity_loss.item(),
-                        "learning_rate": current_lr}, step=epoch)
+            wandb.log({
+                "batched_total_loss": batched_total_loss.item(),
+                "rec_loss": batched_rec_loss.item(),
+                "ortho_loss": batched_ortho_loss.item(),
+                "consistency_loss": batched_consistency_loss.item(),
+                "contrast_loss": batched_contrast_loss.item(),
+                "learning_rate": current_lr
+            }, step=epoch)
         lr_scheduler.step()
+        
         if epoch % 10 == 0:
             # ==========================================
-            # 先基于当前train状态获取诊断数据并打印
-            # ==========================================
-            # 创建一个临时数据加载器用于获取train状态下的诊断数据
-            # 使用训练数据，但不进行参数更新
-            model.train()  # 保持train模式
-            train_flag = True
-            
-            # 使用完整的训练数据来获取诊断信息
-            diagnostics_train_loader = Data.DataLoader(batch_data_train, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=False)
-            
-            # 计算并打印基于train状态的诊断指标
-            diagnostics = compute_diagnostics(model, diagnostics_train_loader, ano_label, all_idx, device, args, normal_for_train_idx=normal_for_train_idx, cache=diagnostic_cache)
-            losses = {
-                'bce': batched_bce_loss.item(),
-                'rec': batched_rec_loss.item(),
-                'ring': batched_ring_loss.item(),
-                'ortho': batched_ortho_loss.item(),
-                'uniformity': batched_uniformity_loss.item()
-            }
-            print_diagnostics(diagnostics, epoch, current_lr=current_lr, losses=losses, dynamic_weights=dynamic_weights, ortho_loss_weight=args.ortho_loss_weight)
-            
-            # ==========================================
-            # 然后进行eval和后续操作（eval时不再输出诊断）
+            # 评估模式
             # ==========================================
             model.eval()
             train_flag = False
 
-            all_batched_logits = []
+            all_batched_anomaly_scores = []
             with torch.no_grad():
                 for _, item in enumerate(test_data_loader):
                     concated_input_features = item[0].to(device)
                     labels = item[1].to(device)
-                    emb, emb_combine, logits, outlier_emb, noised_normal_for_generation_emb, loss_rec, loss_ring, ortho_loss, _, _, _, _ = model(concated_input_features, None, None, None,
-                                                                            train_flag, args)
-                    all_batched_logits.append(logits.squeeze(0))
-                # Concatenate all batched logits
-                concatenated_logits = torch.cat(all_batched_logits, dim=0)
-                logits = np.squeeze(concatenated_logits.cpu().detach().numpy())
-                auc = roc_auc_score(ano_label[idx_test], logits)
-                ap = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
+                    
+                    # MFMGAD 推理模式
+                    # 返回: (embeddings, logits, anomaly_scores, consistency_errors, suspicion_scores, attn_weights)
+                    emb, logits, anomaly_scores, consistency_errors, suspicion_scores, attn_weights = model(
+                        concated_input_features, None, None, normal_for_train_idx, train_flag, args
+                    )
+                    
+                    if anomaly_scores is not None:
+                        all_batched_anomaly_scores.append(anomaly_scores)
+                    else:
+                        # 如果 anomaly_scores 为空，使用 logits 作为备选
+                        all_batched_anomaly_scores.append(logits.squeeze(0))
+                
+                # 拼接所有批次的异常得分
+                concatenated_scores = torch.cat(all_batched_anomaly_scores, dim=0)
+                scores = concatenated_scores.cpu().detach().numpy()
+                
+                auc = roc_auc_score(ano_label[idx_test], scores)
+                ap = average_precision_score(ano_label[idx_test], scores, average='macro', pos_label=1, sample_weight=None)
+            
             wandb.log({"AUC": auc, "AP": ap}, step=epoch)
+            
+            # ==========================================
+            # MFMGAD 诊断信息
+            # ==========================================
+            if epoch % 20 == 0:
+                # 计算诊断指标
+                mfmgad_diagnostics = compute_mfmgad_diagnostics(
+                    model, train_data_loader, ano_label, idx_test, device, args,
+                    normal_for_train_idx=normal_for_train_idx, cache=mfmgad_diagnostic_cache
+                )
+                
+                # 准备损失字典
+                losses = {
+                    'rec': batched_rec_loss.item() if hasattr(batched_rec_loss, 'item') else batched_rec_loss,
+                    'ortho': batched_ortho_loss.item() if hasattr(batched_ortho_loss, 'item') else batched_ortho_loss,
+                    'consistency': batched_consistency_loss.item() if hasattr(batched_consistency_loss, 'item') else batched_consistency_loss,
+                    'contrast': batched_contrast_loss.item() if hasattr(batched_contrast_loss, 'item') else batched_contrast_loss
+                }
+                
+                # 打印诊断信息
+                print_mfmgad_diagnostics(
+                    mfmgad_diagnostics, epoch, 
+                    current_lr=current_lr, 
+                    losses=losses, 
+                    dynamic_weights=dynamic_weights
+                )
             
             # 检查是否为最佳模型
             if auc > best_AUC and ap > best_AP:
@@ -274,26 +302,9 @@ def train(args):
                 best_model_state = model.state_dict().copy()
                 best_epoch = epoch
 
-    pbar.close()  # 关闭进度条
+    pbar.close()
     print(f"Training done! Total time: {total_time:.2f} seconds")
-    if args.visualize:
-        # 加载最佳模型进行tsne可视化
-        if best_model_state is not None:
-            model.eval()
-            # 为了获取人造异常点的嵌入，设置train_flag为True
-            train_flag = True
-
-            # 先运行最后一个 epoch 的模型
-            for _, item in enumerate(test_data_loader):
-                concated_input_features = item[0].to(device)
-                labels = item[1].to(device)
-                emb_last_epoch, _, _, outlier_emb_last_epoch, _, _, _, _, _, _, _, _ = model(concated_input_features, None, None, local_normal_for_train_idx, train_flag, args)
-                create_tsne_visualization(concated_input_features[:, 0, :], emb_last_epoch, labels, best_epoch, normal_for_train_idx, outlier_emb_last_epoch, args)
-                break
-            
-            # 创建tsne可视化
-            # 获取邻接矩阵（去掉batch维度）
-            adj_matrix_np = adj.squeeze(0).detach().cpu().numpy()
+    print(f"Best AUC: {best_AUC:.4f}, Best AP: {best_AP:.4f}, Best Epoch: {best_epoch}")
         
         
 
@@ -386,6 +397,20 @@ if __name__ == "__main__":
     parser.add_argument('--end_lr', type=float, default=1e-4)
 
     parser.add_argument('--warmup_epoch', type=int, default=20)
+
+    # ==================== MFMGAD 新增参数 ====================
+    # Masked Frequency Prediction 相关
+    parser.add_argument('--mask_ratio', type=float, default=0.25, help='Ratio of frequency tokens to mask during training')
+    parser.add_argument('--consistency_weight', type=float, default=1.0, help='Weight for consistency loss in masked frequency prediction')
+    
+    # Mining 对比学习相关
+    parser.add_argument('--mining_threshold_base', type=float, default=0.5, help='Base threshold for mining pseudo-anomalies')
+    parser.add_argument('--mining_temperature', type=float, default=1.0, help='Temperature for soft label computation')
+    parser.add_argument('--suspicion_lambda', type=float, default=0.5, help='Weight for consistency error in suspicion score')
+    parser.add_argument('--suspicion_weight', type=float, default=1.0, help='Weight for suspicion in anomaly score')
+    
+    # 双分支损失权重
+    parser.add_argument('--contrast_weight', type=float, default=1.0, help='Weight for contrastive loss in dual-branch learning')
 
     # Ablation Study
     parser.add_argument('--ablation_random_dir', type=str2bool, default=False, help='Ablation study: randomize perturbation direction')
