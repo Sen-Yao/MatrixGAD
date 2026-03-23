@@ -36,4 +36,4 @@ python run.py --batch_size=8192 --dataset=t_finance --end_lr=0.0001 --lambda_rec
 
 python run.py --batch_size=1024 --dataset=tolokers --end_lr=0.0001 --lambda_rec_emb=0.5 --num_epoch=70 --outlier_beta=0.3 --peak_lr=0.0001 --pp_k=3 --progregate_alpha=0.3 --rec_loss_weight=0.1 --ring_R_max=0.5 --ring_R_min=0.5 --ring_loss_weight=20 --seed=0 --train_rate=0.05 --warmup_updates=50
 
-CUDA_VISIBLE_DEVICES=1 python run.py --batch_size=1024 --dataset=tolokers --end_lr=0.0001 --lambda_rec_emb=0.5 --num_epoch=70 --outlier_beta=0.3 --peak_lr=0.0001 --pp_k=3 --progregate_alpha=0.3 --rec_loss_weight=0.1 --ring_R_max=0.5 --ring_R_min=0.5 --ring_loss_weight=20 --seed=0 --train_rate=0.05 --warmup_updates=50
+CUDA_VISIBLE_DEVICES=1 python run.py --batch_size=128 --dataset=photo --end_lr=1e-4 --lambda_rec_emb=0.1 --num_epoch=200 --peak_lr=5e-4 --pp_k=6 --progregate_alpha=0.2 --rec_loss_weight=1 --ring_R_max=1 --ring_R_min=0.3 --ring_loss_weight=1 --seed=2 --train_rate=0.05 --warmup_updates=50
